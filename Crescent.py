@@ -92,8 +92,7 @@ commands:
   recommend (rec)      fetch 5 related YouTube videos (falls back to shuffle if none)
   blacklist            add current track to blacklist (skip in shuffle)
   blacklist remove     remove current track from blacklist
-  remove all           wipe the entire remembered library
-  delete all           wipe the entire remembered library
+  clear list           wipe the entire remembered library
   pause                pause playback
   play                 resume/unpause playback
   skip                 stop current track, play next in queue
@@ -2131,7 +2130,7 @@ def main(scr):
                 help_lines = [
                     "commands:",
                     "  play <url|search> · shuffle [genre] · list · info · dl [url] · tag <genre>",
-                    "  remove all · delete all · clear list · pause · skip · back · stop · vol <n> · ask · exit",
+                    "  clear list · pause · skip · back · stop · vol <n> · ask · exit",
                 ]
                 for i, line in enumerate(help_lines):
                     put(scr, ROW_STATUS + i, 2, line, curses.color_pair(4))
