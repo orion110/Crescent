@@ -7,65 +7,68 @@ import curses, json, os, queue, random, re, socket, subprocess, sys, textwrap, t
 IS_TERMUX = os.environ.get("TERMUX_VERSION") is not None
 TMPDIR = os.environ.get("TMPDIR", "/tmp")
 SOCK = os.path.join(TMPDIR, "play-mpv.sock")
+DEBUG_LOG = os.path.expanduser("~/.crescent_termux_debug.log")
+
+def debug_log(msg):
+    try:
+        with open(DEBUG_LOG, "a") as f:
+            f.write(f"{time.ctime()} | {msg}\n")
+    except:
+        pass
+
+debug_log("=== Crescent starting ===")
 
 # ---- Binary checks ----
 def check_binary(name):
     if shutil.which(name) is None:
         sys.exit(f"ERROR: required program '{name}' not found in PATH.\n"
-                 f"On Termux, install it with: pkg install {name}\n"
-                 f"(or for yt-dlp, also try: pip install yt-dlp)")
+                 f"On Termux, install it with: pkg install {name}")
 check_binary("mpv")
-# yt-dlp is optional if we have the Python module, but we try to use it first.
-# The script will fall back to the module if the binary is missing.
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 MODEL      = "qwen2:0.5b"      # <- change to any model from `ollama list`
 DEBUG      = False             # <- set True to show the [debug] line
-STATUS_TTL = 5                 # <- status messages AND queue line disappear after this many seconds
-OFFLINE_CATCHALL_CHANCE = 0.65 # <- odds (0.0-1.0) that unrecognized chat text gets a canned
-                                #    offline reply instead of being sent to Ollama. 0 = old
-                                #    behavior (always ask Ollama when no trigger matches),
-                                #    1 = never bother Ollama for ordinary chat.
-LIB_FILE   = os.path.expanduser("~/.crescent_library.json")   # remembered tracks + metadata
-SETTINGS_FILE = os.path.expanduser("~/.crescent_settings.json")  # lightweight UI/settings persistence
-BLACKLIST_FILE = os.path.expanduser("~/.crescent_blacklist.json")  # URLs to skip in shuffle
-
-# Optional cookies file (Netscape format, exported from a logged-in browser).
+STATUS_TTL = 5
+OFFLINE_CATCHALL_CHANCE = 0.65
+LIB_FILE   = os.path.expanduser("~/.crescent_library.json")
+SETTINGS_FILE = os.path.expanduser("~/.crescent_settings.json")
+BLACKLIST_FILE = os.path.expanduser("~/.crescent_blacklist.json")
 COOKIES_FILE = os.path.expanduser("~/.crescent_cookies.txt")
 if not os.path.exists(COOKIES_FILE):
     COOKIES_FILE = None
 
-# MPRIS support (KDE Connect media control, GNOME media widgets, playerctl, etc.)
 MPRIS_SCRIPT_PATHS = [
     os.path.expanduser("~/.config/mpv/scripts/mpris.so"),
     "/usr/lib/mpv-mpris/mpris.so",
     "/usr/local/lib/mpv-mpris/mpris.so",
 ]
 
-# logo — swoosh, top left
-MARK = [
-    "⠀⠀⠀⠀⣀⣤⡶⠟⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
-    "⠀⠀⣠⣾⡿⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
-    "⠀⣼⣿⡿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
-    "⣼⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
-    "⣿⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡀",
-    "⣿⣿⣿⣧⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⠁",
-    "⢻⣿⣿⣿⣧⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⡿⠀",
-    "⠀⢿⣿⣿⣿⣿⣦⣀⠀⠀⠀⠀⠀⠀⠀⢀⣠⣶⡿⠀⠀",
-    "⠀⠀⠙⢿⣿⣿⣿⣿⣿⣶⣶⣶⣶⣶⣾⣿⡿⠋⠀⠀⠀",
-    "⠀⠀⠀⠀⠙⠻⠿⣿⣿⣿⣿⣿⣿⡿⠟⠋⠀⠀⠀⠀⠀",
-]
+# ---- Logo with fallback ----
+try:
+    MARK = [
+        "⠀⠀⠀⠀⣀⣤⡶⠟⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+        "⠀⠀⣠⣾⡿⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+        "⠀⣼⣿⡿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+        "⣼⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+        "⣿⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡀",
+        "⣿⣿⣿⣧⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⠁",
+        "⢻⣿⣿⣿⣧⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⡿⠀",
+        "⠀⢿⣿⣿⣿⣿⣦⣀⠀⠀⠀⠀⠀⠀⠀⢀⣠⣶⡿⠀⠀",
+        "⠀⠀⠙⢿⣿⣿⣿⣿⣿⣶⣶⣶⣶⣶⣾⣿⡿⠋⠀⠀⠀",
+        "⠀⠀⠀⠀⠙⠻⠿⣿⣿⣿⣿⣿⣿⡿⠟⠋⠀⠀⠀⠀⠀",
+    ]
+except:
+    MARK = ["[ Crescent ]", "~" * 20]
 
-# vertical layout — logo, waves, input, now-playing under the input, status/queue
 ROW_MARK   = 0
 ROW_WAVES  = ROW_MARK + len(MARK) + 3
-ROW_INPUT  = ROW_WAVES + 2      # Crescent : input right under the waves
-ROW_STATE  = ROW_INPUT + 2      # now-playing line under the input
-ROW_STATUS = ROW_STATE + 3      # extra breathing room below now-playing
-STATUS_LINE_GAP = 2             # rows between each status message (spaced out, not stacked)
+ROW_INPUT  = ROW_WAVES + 2
+ROW_STATE  = ROW_INPUT + 2
+ROW_STATUS = ROW_STATE + 3
+STATUS_LINE_GAP = 2
 
 BARS = " ▁▂▃▄▅▆▇█"
-SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"   # in-progress spinner for "..." status lines
+SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 def spinner_char():
     return SPINNER_FRAMES[int(time.time() * 8) % len(SPINNER_FRAMES)]
@@ -82,7 +85,8 @@ commands:
   shuffle <genre>      stop current and play a shuffled remembered track of that genre
   list                 show recently played tracks
   count                show how many links are remembered
-  info                 show metadata for the current track
+  info                 show detailed metadata for current track (incl. URL)
+  dl [url]             download current track (or specified URL) as MP3
   tag <genre>          tag the current track with a genre
   genres               list all genres in the library with track counts
   recommend (rec)      fetch 5 related YouTube videos (falls back to shuffle if none)
@@ -90,7 +94,7 @@ commands:
   blacklist remove     remove current track from blacklist
   delete <n>           delete item <n> from the list/count results
   delete               delete the current track from the library
-  remove all            wipe the entire remembered library
+  remove all           wipe the entire remembered library
   pause                pause playback
   play                 resume/unpause playback
   skip                 stop current track, play next in queue
@@ -118,30 +122,41 @@ commands:
   from a remote widget acts on mpv's own playlist, not Crescent's
   queue, so use Crescent's own skip/back for queue-aware navigation."""
 
-
-# ─────────────────────────── mpv control ───────────────────────────
+# ─────────────────────────── mpv control (Termux audio fix + error capture) ───────────────────────────
 class Mpv:
     def __init__(self):
         if os.path.exists(SOCK):
-            os.unlink(SOCK)
+            try: os.unlink(SOCK)
+            except: pass
         args = ["mpv", "--no-video", "--no-terminal", "--idle", "--really-quiet",
                 f"--input-ipc-server={SOCK}"]
+        if IS_TERMUX:
+            if shutil.which("pulseaudio"):
+                args.append("--audio-device=pulse")
+            else:
+                args.append("--audio-device=auto")
         mpris_script = next((p for p in MPRIS_SCRIPT_PATHS if os.path.exists(p)), None)
         self.mpris_active = mpris_script is not None
         if mpris_script:
             args.append(f"--script={mpris_script}")
-        self.p = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        debug_log(f"mpv args: {args}")
+        self.p = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        for _ in range(20):
+            if os.path.exists(SOCK):
+                break
+            time.sleep(0.1)
 
     def cmd(self, *c):
         try:
             s = socket.socket(socket.AF_UNIX)
-            s.settimeout(0.25)
+            s.settimeout(0.5)
             s.connect(SOCK)
             s.send((json.dumps({"command": list(c)}) + "\n").encode())
             r = s.recv(65536)
             s.close()
             return json.loads(r.split(b"\n")[0])
-        except Exception:
+        except Exception as e:
+            debug_log(f"cmd error: {e} {c}")
             return {}
 
     def prop(self, name):
@@ -159,7 +174,7 @@ class Mpv:
         try:
             self.cmd("af", "add", "@vis:lavfi=[astats=metadata=1:reset=1]")
         except Exception:
-            pass  # ignore failure (e.g., on Termux where lavfi may not be available)
+            pass
 
     def level(self):
         try:
@@ -171,28 +186,33 @@ class Mpv:
                 if k.endswith("RMS_level"):
                     try:
                         readings.append(float(v))
-                    except (TypeError, ValueError):
+                    except:
                         pass
             if not readings:
                 return None
             db = sum(readings) / len(readings)
             return max(0.0, min(1.0, (db + 60.0) / 60.0))
-        except Exception:
+        except:
             return None
 
     def alive(self):
         return self.p.poll() is None
 
+    def get_last_error(self):
+        if self.p and self.p.stderr:
+            try:
+                return self.p.stderr.read()
+            except:
+                return "Could not read stderr"
+        return "No error captured"
 
 # ─────────────────────────── library & blacklist ───────────────────────────
 _LIB_LOCK = threading.Lock()
 _BLACKLIST_LOCK = threading.Lock()
-_QUEUE_LOCK = threading.Lock()  # guards ps["queue"] / ps["history"] across threads
+_QUEUE_LOCK = threading.Lock()
+_ADVANCE_LOCK = threading.Lock()
 
 def log_bg_error(context):
-    """Write a full traceback for an exception raised on a background thread.
-    Background thread exceptions otherwise print to stderr and vanish if the
-    terminal is under curses control, so this is the only record you get."""
     import traceback
     try:
         with open(os.path.expanduser("~/.crescent_rec_debug.log"), "a") as dbg:
@@ -231,7 +251,6 @@ def remove_blacklist(url):
     bl.discard(url)
     save_blacklist(bl)
 
-# genre keywords auto-detected from title + YouTube tags — extend freely
 GENRE_WORDS = sorted([
     "dark ambient", "deep house", "drum and bass", "hip hop", "lo-fi", "lofi",
     "progressive house", "progressive rock", "post rock", "post-rock",
@@ -350,8 +369,7 @@ def fmt_dur(s):
     m, sec = divmod(rem, 60)
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
-
-# ─────────────────────────── metadata resolution (yt-dlp) ───────────────────────────
+# ─────────────────────────── metadata resolution ───────────────────────────
 def _meta_fields(info):
     if not isinstance(info, dict):
         return None
@@ -400,7 +418,6 @@ def _meta_from_cli(url):
     last_err = None
     for binary in candidates:
         try:
-            # Skip if binary doesn't exist (for shell commands)
             if isinstance(binary, list) and binary[0] not in ("yt-dlp", "youtube-dl") and not shutil.which(binary[0]):
                 continue
             m = _run_get_meta(binary, url)
@@ -434,7 +451,7 @@ def _resolve_meta(url, ps, status=None, mpv=None):
             m = _meta_from_module(url)
         except Exception as e:
             if status is not None and not m:
-                say(status, f"metadata lookup failed: {e}", sticky=True)
+                say(status, f"metadata lookup failed: {e} (playback continues)", sticky=True)
             return
     if m:
         ps["resolved"] = m["title"]
@@ -442,27 +459,16 @@ def _resolve_meta(url, ps, status=None, mpv=None):
         if mpv is not None and ps.get("history") and ps["history"][-1][0] == url:
             mpv.set_title(m["title"])
     elif status is not None:
-        say(status, "metadata lookup: no data returned")
+        say(status, "metadata lookup: no data returned (playback continues)", sticky=True)
 
 def start_resolve(url, ps, status=None, mpv=None):
     threading.Thread(target=_resolve_meta, args=(url, ps, status, mpv), daemon=True).start()
 
-
 def is_url(s):
     return s.startswith("http://") or s.startswith("https://")
 
-
-# ─────────────────────────── related videos (yt-dlp) ───────────────────────────
+# ─────────────────────────── related videos ───────────────────────────
 def get_related_videos(video_url, limit=10):
-    """
-    Fetch related video URLs using yt-dlp.
-
-    Prioritizes:
-      1. Recent uploads from the same channel (most likely different tracks).
-      2. Artist name search (extracted from title) – gives other songs by the artist.
-      3. Search by the video's cleaned title (fallback).
-      4. Keyword search on the channel name (last resort).
-    """
     def extract_video_id(url):
         match = re.search(r"(?:v=|youtu\.be/|/v/|/embed/)([a-zA-Z0-9_-]{11})", url)
         return match.group(1) if match else None
@@ -470,11 +476,9 @@ def get_related_videos(video_url, limit=10):
     current_id = extract_video_id(video_url)
 
     def clean_title(title):
-        # Strip bracketed/parenthetical noise and common modifiers
         title = re.sub(
             r"[\(\[][^\)\]]*(official|lyric|audio|video|visualizer|remaster|hd|hq|4k)[^\)\]]*[\)\]]",
             "", title, flags=re.I)
-        # Remove modifiers like slowed, reverb, extended, 8d, sped up, etc.
         title = re.sub(r'\b(slowed|reverb|sped up|8d|extended|heavily|remix|cover|version)\b', '', title, flags=re.I)
         title = re.sub(r'\s+', ' ', title).strip()
         return title
@@ -503,7 +507,6 @@ def get_related_videos(video_url, limit=10):
     last_error = [""]
 
     def run(cmd, timeout=20):
-        # Ensure the command exists
         if isinstance(cmd, list) and cmd[0] not in ("yt-dlp", "youtube-dl") and not shutil.which(cmd[0]):
             last_error[0] = f"{cmd[0]} not found"
             return ""
@@ -524,7 +527,6 @@ def get_related_videos(video_url, limit=10):
             last_error[0] = str(e)[:200]
         return ""
 
-    # Get title/channel with multiple client attempts
     title = channel = channel_url = None
     clients = ["web", "android", "tv"]
     for client in clients:
@@ -541,7 +543,6 @@ def get_related_videos(video_url, limit=10):
             except Exception as e:
                 last_error[0] = f"couldn't parse metadata: {e}"
     if not title and not channel:
-        # Try a simple extract from URL (if it's a channel link)
         if "/channel/" in video_url:
             channel_id = re.search(r"/channel/([^/?]+)", video_url)
             if channel_id:
@@ -559,11 +560,6 @@ def get_related_videos(video_url, limit=10):
     if not title and not channel and not last_error[0]:
         last_error[0] = "no title/channel found from any source"
 
-    # Detect whether this looks like a music upload ("Artist - Title") vs.
-    # topic/ambience content (backrooms ambient, lofi mixes, soundscapes,
-    # etc). For the latter, the uploading channel's OTHER videos are often
-    # unrelated, so a topic-based search should be tried first instead of
-    # defaulting to that channel's uploads.
     artist = None
     if title and " - " in title:
         parts = title.split(" - ", 1)
@@ -616,7 +612,6 @@ def get_related_videos(video_url, limit=10):
     if is_music_style:
         order = [search_channel_uploads, search_by_artist, search_by_title, search_channel_keyword]
     else:
-        # Topic/ambient content: search by what it's actually about first.
         order = [search_by_title, search_channel_uploads, search_channel_keyword]
 
     for step in order:
@@ -625,7 +620,6 @@ def get_related_videos(video_url, limit=10):
             return urls, ""
 
     return [], (last_error[0] or "all methods exhausted")
-
 
 # ─────────────────────────── ollama ───────────────────────────
 def ollama_worker(prompt, out, width):
@@ -641,6 +635,34 @@ def ollama_worker(prompt, out, width):
     for line in textwrap.wrap(text, width=max(20, width)) or ["(no output)"]:
         out.put(line)
 
+# ─────────────────────────── download helper ───────────────────────────
+def download_track(url, title, status, out):
+    """Download audio from url to ~/Music/Crescent/ using yt-dlp."""
+    if not shutil.which("yt-dlp"):
+        say(status, "yt-dlp not installed. Please install it: pip install yt-dlp", sticky=True)
+        return
+    dl_dir = os.path.expanduser("~/Music/Crescent")
+    os.makedirs(dl_dir, exist_ok=True)
+    safe_title = re.sub(r'[^\w\-_\. ]', '_', title) if title else "unknown"
+    out_template = os.path.join(dl_dir, f"{safe_title}.%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "-x", "--audio-format", "mp3",
+        "--embed-thumbnail", "--add-metadata",
+        "-o", out_template,
+        url
+    ]
+    say(status, f"Downloading: {title} ...", sticky=False)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = proc.communicate()
+        if proc.returncode == 0:
+            say(status, f"Download complete: {title} -> {dl_dir}", sticky=True)
+        else:
+            err = stderr.strip() or stdout.strip()
+            say(status, f"Download failed: {err[:100]}", sticky=True)
+    except Exception as e:
+        say(status, f"Download error: {e}", sticky=True)
 
 # ─────────────────────────── commands ───────────────────────────
 def resolve(arg):
@@ -676,9 +698,6 @@ def is_youtube_url(s):
         return False
 
 def can_recommend_from(s):
-    """True for anything get_related_videos can actually work with: real
-    YouTube links, or the 'ytsearchN:...' pseudo-urls used for searched
-    tracks (yt-dlp resolves those to real metadata itself)."""
     return bool(s) and (is_youtube_url(s) or s.startswith("ytsearch"))
 
 WAVE_STYLES = [
@@ -698,8 +717,7 @@ def offline_brain(event, value=""):
     }
     return messages.get(event, value or "Ready.")
 
-
-# ─────────────────────────── OFFLINE BRAIN — SUPER LIVELY ───────────────────────────
+# ─────────────────────────── OFFLINE BRAIN ───────────────────────────
 import re as _re
 
 def _hit(c, triggers):
@@ -711,7 +729,6 @@ def _hit(c, triggers):
     return False
 
 def _track_context(ps):
-    """Return a dict with title, genre, artist for the current track, or None."""
     if not ps or not ps.get("history"):
         return None
     url, _ = ps["history"][-1]
@@ -730,7 +747,6 @@ def _track_context(ps):
             artist = entry["channel"]
     return {"title": title, "genre": genre, "artist": artist}
 
-# --- GREETINGS ---
 GREETINGS = [
     "hey", "hi", "hello", "yo", "sup", "what's up", "whats up", "hiya", "howdy",
     "hey there", "hi there", "yo yo", "greetings", "morning", "good morning",
@@ -765,7 +781,6 @@ GREETING_REPLIES = [
     "Yo! {title} is on, and it's got that groove – you feel me?",
 ]
 
-# --- HOW ARE YOU ---
 HOW_ARE_YOU = [
     "how are you", "how r u", "you ok", "you good", "hows it going", "how's it going",
     "how you doing", "how are things", "how have you been", "you alright", "u good",
@@ -798,7 +813,6 @@ HOW_REPLIES = [
     "Never better – this beat from {title} is infectious. You?",
 ]
 
-# --- WEATHER ---
 WEATHER_TRIGGERS = [
     "weather", "rain", "raining", "sunny", "cloudy", "storm", "snow",
     "how's the weather", "is it raining", "what's the forecast",
@@ -823,7 +837,6 @@ WEATHER_REPLIES = [
     "Whether it's rain or shine, {title} always fits the mood.",
 ]
 
-# --- TIME ---
 TIME_TRIGGERS = [
     "what time", "time is", "what's the time", "tell me the time", "clock",
     "late", "early", "night", "morning", "afternoon", "evening",
@@ -845,7 +858,6 @@ TIME_REPLIES = [
     "It's always 'music o'clock' when {title} is on.",
 ]
 
-# --- MOOD / FEELINGS ---
 MOOD_TRIGGERS = [
     "i feel", "i'm feeling", "feeling", "mood", "happy", "sad", "angry",
     "tired", "energized", "lonely", "chill", "anxious", "relaxed", "excited",
@@ -881,7 +893,6 @@ MOOD_REPLIES = [
     "In a mood? {title} will match whatever you're feeling – it's versatile.",
 ]
 
-# --- GENRE RECOMMENDATIONS ---
 GENRE_TRIGGERS = [
     "recommend", "suggestion", "what should i listen", "give me a genre",
     "what genre", "genre", "what's good",
@@ -911,7 +922,6 @@ GENRE_REPLIES = [
     "Surprise yourself with {genre} – {title} is a wild ride.",
 ]
 
-# --- MUSIC TRIVIA ---
 TRIVIA_TRIGGERS = [
     "fact", "did you know", "music trivia", "tell me something interesting",
     "interesting", "fun fact",
@@ -934,7 +944,6 @@ TRIVIA_REPLIES = [
     "Did you know? The theremin is the only instrument you play without touching – {title} has that same ethereal quality.",
 ]
 
-# --- VOLUME ---
 VOLUME_TRIGGERS = [
     "volume", "turn it up", "louder", "quieter", "turn it down", "mute",
     "vol", "sound",
@@ -954,7 +963,6 @@ VOLUME_REPLIES = [
     "Turn it down a notch? But {title} is so good!",
 ]
 
-# --- NIGHT / LATE ---
 NIGHT_TRIGGERS = [
     "good night", "night", "late", "bedtime", "sleep", "tired", "zzz",
 ]
@@ -971,7 +979,6 @@ NIGHT_REPLIES = [
     "Rest now – {title} is a gentle wave to carry you to dreamland.",
 ]
 
-# --- COMPLIMENTS ---
 COMPLIMENT_TRIGGERS = [
     "good job", "well done", "nice work", "youre great", "you're great",
     "good bot", "good ai", "you rock", "awesome", "you're awesome",
@@ -992,7 +999,6 @@ COMPLIMENT_REPLIES = [
     "I love you too – and {title} is our anthem.",
 ]
 
-# --- INSULTS ---
 INSULT_TRIGGERS = [
     "youre dumb", "you're dumb", "you suck", "youre useless", "you're useless",
     "bad bot", "stupid", "you're stupid", "worst", "terrible",
@@ -1010,7 +1016,6 @@ INSULT_REPLIES = [
     "Haters gonna hate – but {title} is gonna play.",
 ]
 
-# --- YES / NO ---
 YES_TRIGGERS = ["yes", "yeah", "yep", "yup", "sure", "ok", "okay", "alright",
                 "sounds good", "correct", "right", "affirmative", "aye", "roger"]
 YES_REPLIES = [
@@ -1039,7 +1044,6 @@ NO_REPLIES = [
     "Not today? – {title} will be here when you're ready.",
 ]
 
-# --- THANKS ---
 THANKS_TRIGGERS = ["thanks", "thank you", "thx", "ty", "appreciate it", "cheers", "much obliged"]
 THANKS_REPLIES = [
     "Anytime! That's what I'm here for. – enjoy {title}!",
@@ -1052,7 +1056,6 @@ THANKS_REPLIES = [
     "Thanks for the kind words – {title} is the real star.",
 ]
 
-# --- FAREWELL ---
 FAREWELL_TRIGGERS = [
     "bye", "goodbye", "see ya", "see you", "later", "cya", "gtg", "gotta go",
     "im out", "i'm out", "peace", "night", "goodnight", "good night",
@@ -1071,7 +1074,6 @@ FAREWELL_REPLIES = [
     "Until next time – {title} is on repeat for you.",
 ]
 
-# --- JOKES ---
 JOKE_TRIGGERS = ["tell me a joke", "say something funny", "make me laugh", "joke", "funny"]
 JOKE_REPLIES = [
     "Why did the DJ get locked out? Left the keys in the mix. – but {title} is still playing.",
@@ -1088,7 +1090,6 @@ JOKE_REPLIES = [
     "Why did the beat drop? Because it was too heavy to hold. – just like the drop in {title}.",
 ]
 
-# --- QUIRKY BANTER ---
 BANTER_TRIGGERS = [
     "you're cute", "you're beautiful", "handsome", "pretty", "cool",
     "what's your favorite", "favorite", "like", "dislike",
@@ -1106,7 +1107,6 @@ BANTER_REPLIES = [
     "What's my favorite? This one – {title} – it's amazing.",
 ]
 
-# --- STATUS / CURRENT TRACK ---
 TRACK_TRIGGERS = [
     "what is this", "what's playing", "current track", "now playing",
     "who is this", "artist", "song title",
@@ -1119,7 +1119,6 @@ def track_reply(ps):
             return f"You're listening to '{ctx['title']}'{artist}. Pretty sweet, right? The {ctx['genre']} vibes are strong!"
     return "Nothing's playing at the moment – queued something up? I'm ready!"
 
-# --- CATCH-ALL ---
 CATCHALL_REPLIES = [
     "Not sure I follow, but I'm here. Want me to queue {title} again?",
     "I'm more of a music brain than a conversation brain. Try 'shuffle' or 'recommend' – {title} is a good start.",
@@ -1138,57 +1137,6 @@ CATCHALL_REPLIES = [
     "Let's not overthink – {title} is the answer.",
 ]
 
-def offline_reply(prompt, ps=None):
-    c = prompt.lower().strip().rstrip("?!.")
-    ctx = _track_context(ps)
-    if not ctx:
-        ctx = {"title": "music", "genre": "music", "artist": ""}
-    chosen = None
-    if _hit(c, GREETINGS):
-        chosen = random.choice(GREETING_REPLIES)
-    elif _hit(c, HOW_ARE_YOU):
-        chosen = random.choice(HOW_REPLIES)
-    elif _hit(c, WEATHER_TRIGGERS):
-        chosen = random.choice(WEATHER_REPLIES)
-    elif _hit(c, TIME_TRIGGERS):
-        chosen = random.choice(TIME_REPLIES).format("some")
-    elif _hit(c, MOOD_TRIGGERS):
-        chosen = random.choice(MOOD_REPLIES)
-    elif _hit(c, GENRE_TRIGGERS):
-        chosen = random.choice(GENRE_REPLIES)
-    elif _hit(c, TRIVIA_TRIGGERS):
-        chosen = random.choice(TRIVIA_REPLIES)
-    elif _hit(c, VOLUME_TRIGGERS):
-        chosen = random.choice(VOLUME_REPLIES)
-    elif _hit(c, NIGHT_TRIGGERS):
-        chosen = random.choice(NIGHT_REPLIES)
-    elif _hit(c, THANKS_TRIGGERS):
-        chosen = random.choice(THANKS_REPLIES)
-    elif _hit(c, FAREWELL_TRIGGERS):
-        chosen = random.choice(FAREWELL_REPLIES)
-    elif _hit(c, JOKE_TRIGGERS):
-        chosen = random.choice(JOKE_REPLIES)
-    elif _hit(c, COMPLIMENT_TRIGGERS):
-        chosen = random.choice(COMPLIMENT_REPLIES)
-    elif _hit(c, INSULT_TRIGGERS):
-        chosen = random.choice(INSULT_REPLIES)
-    elif c in YES_TRIGGERS:
-        chosen = random.choice(YES_REPLIES)
-    elif c in NO_TRIGGERS:
-        chosen = random.choice(NO_REPLIES)
-    elif _hit(c, BANTER_TRIGGERS):
-        chosen = random.choice(BANTER_REPLIES)
-    elif _hit(c, ["what's playing", "now playing", "current track", "what is this"]):
-        return track_reply(ps)
-    if chosen:
-        try:
-            return chosen.format(title=ctx['title'], genre=ctx['genre'], artist=ctx['artist'])
-        except KeyError:
-            return chosen
-    return None
-
-
-# --- AMBIENT LINES (now even more engaging) ---
 AMBIENT_LINES = [
     "Enjoying {title}? What's your favorite part so far?",
     "This one's got a nice groove – {title} is proof. Are you a fan of {genre}?",
@@ -1290,6 +1238,55 @@ AMBIENT_LINES = [
     "It's just you, me, and the music. Perfect – and {title} is the music. Enjoy the moment.",
 ]
 
+def offline_reply(prompt, ps=None):
+    c = prompt.lower().strip().rstrip("?!.")
+    ctx = _track_context(ps)
+    if not ctx:
+        ctx = {"title": "music", "genre": "music", "artist": ""}
+    chosen = None
+    if _hit(c, GREETINGS):
+        chosen = random.choice(GREETING_REPLIES)
+    elif _hit(c, HOW_ARE_YOU):
+        chosen = random.choice(HOW_REPLIES)
+    elif _hit(c, WEATHER_TRIGGERS):
+        chosen = random.choice(WEATHER_REPLIES)
+    elif _hit(c, TIME_TRIGGERS):
+        chosen = random.choice(TIME_REPLIES).format("some")
+    elif _hit(c, MOOD_TRIGGERS):
+        chosen = random.choice(MOOD_REPLIES)
+    elif _hit(c, GENRE_TRIGGERS):
+        chosen = random.choice(GENRE_REPLIES)
+    elif _hit(c, TRIVIA_TRIGGERS):
+        chosen = random.choice(TRIVIA_REPLIES)
+    elif _hit(c, VOLUME_TRIGGERS):
+        chosen = random.choice(VOLUME_REPLIES)
+    elif _hit(c, NIGHT_TRIGGERS):
+        chosen = random.choice(NIGHT_REPLIES)
+    elif _hit(c, THANKS_TRIGGERS):
+        chosen = random.choice(THANKS_REPLIES)
+    elif _hit(c, FAREWELL_TRIGGERS):
+        chosen = random.choice(FAREWELL_REPLIES)
+    elif _hit(c, JOKE_TRIGGERS):
+        chosen = random.choice(JOKE_REPLIES)
+    elif _hit(c, COMPLIMENT_TRIGGERS):
+        chosen = random.choice(COMPLIMENT_REPLIES)
+    elif _hit(c, INSULT_TRIGGERS):
+        chosen = random.choice(INSULT_REPLIES)
+    elif c in YES_TRIGGERS:
+        chosen = random.choice(YES_REPLIES)
+    elif c in NO_TRIGGERS:
+        chosen = random.choice(NO_REPLIES)
+    elif _hit(c, BANTER_TRIGGERS):
+        chosen = random.choice(BANTER_REPLIES)
+    elif _hit(c, TRACK_TRIGGERS):
+        return track_reply(ps)
+    if chosen:
+        try:
+            return chosen.format(title=ctx['title'], genre=ctx['genre'], artist=ctx['artist'])
+        except KeyError:
+            return chosen
+    return None
+
 # ─────────────────────────── ui helpers ───────────────────────────
 def put(scr, y, x, text, attr):
     try:
@@ -1299,7 +1296,6 @@ def put(scr, y, x, text, attr):
 
 def say(status, msg, sticky=False, voice="system"):
     status.append((time.time(), msg, sticky, voice))
-
 
 def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
     raw = buf_str.strip()
@@ -1321,6 +1317,8 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
             mpv.load(url)
             mpv.set_title(source_display(disp))
             ps["loaded"] = True
+            ps["track_loaded_successfully"] = True
+            ps["manual_stop"] = False
             ps["name"] = disp
             ps["resolved"] = source_display(disp)
             ps["history"].append((url, disp))
@@ -1344,6 +1342,8 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
             mpv.set_title(title)
             mpv.cmd("set", "pause", False)
             ps["loaded"] = True
+            ps["track_loaded_successfully"] = True
+            ps["manual_stop"] = False
             ps["name"] = title
             ps["resolved"] = title
             ps["history"].append((url, title))
@@ -1363,6 +1363,8 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
         else:
             mpv.load(target)
             ps["loaded"] = True
+            ps["track_loaded_successfully"] = False
+            ps["manual_stop"] = False
             ps["name"] = arg
             ps["resolved"] = None
             ps["history"].append((target, arg))
@@ -1395,6 +1397,8 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
             mpv.set_title(title)
             mpv.cmd("set", "pause", False)
             ps["loaded"] = True
+            ps["track_loaded_successfully"] = True
+            ps["manual_stop"] = False
             ps["name"] = title
             ps["resolved"] = title
             ps["history"].append((url, title))
@@ -1530,25 +1534,62 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
         if not ps["history"]:
             say(status, "nothing playing")
         else:
-            v = load_library().get(ps["history"][-1][0])
+            url = ps["history"][-1][0]
+            v = load_library().get(url)
             if not v:
                 say(status, "no metadata yet for this track")
             else:
-                say(status, v.get("title", "?"))
-                bits = []
+                lines = []
+                lines.append(f"Title: {v.get('title', '?')}")
+                lines.append(f"URL: {url}")
                 if v.get("channel"):
-                    bits.append("by " + v["channel"])
+                    lines.append(f"Channel: {v['channel']}")
                 if v.get("duration"):
-                    bits.append(fmt_dur(v["duration"]))
+                    lines.append(f"Duration: {fmt_dur(v['duration'])}")
                 if v.get("views"):
-                    bits.append(f"{v['views']:,} views")
+                    lines.append(f"Views: {v['views']:,}")
                 if v.get("genres"):
-                    bits.append("[" + ", ".join(v["genres"]) + "]")
+                    lines.append(f"Genres: {', '.join(v['genres'])}")
                 if v.get("plays"):
-                    bits.append(f"{v['plays']} plays")
-                if is_blacklisted(ps["history"][-1][0]):
-                    bits.append("🚫 blacklisted")
-                say(status, " · ".join(bits) or "(no extra metadata)")
+                    lines.append(f"Plays: {v['plays']}")
+                if v.get("last"):
+                    last_ts = v["last"]
+                    delta = time.time() - last_ts
+                    if delta < 60:
+                        last_str = "just now"
+                    elif delta < 3600:
+                        last_str = f"{int(delta/60)} min ago"
+                    elif delta < 86400:
+                        last_str = f"{int(delta/3600)} hours ago"
+                    else:
+                        last_str = f"{int(delta/86400)} days ago"
+                    lines.append(f"Last played: {last_str}")
+                lines.append(f"Blacklisted: {'Yes' if is_blacklisted(url) else 'No'}")
+                if is_youtube_url(url):
+                    lines.append("Source: YouTube")
+                elif os.path.exists(url):
+                    lines.append("Source: Local file")
+                elif url.startswith("ytsearch"):
+                    lines.append("Source: YouTube search")
+                else:
+                    lines.append("Source: Unknown")
+                full = "\n".join(lines)
+                say(status, full, sticky=True)
+
+    elif cmd == "dl":
+        if arg:
+            target = resolve(arg)
+            title = os.path.basename(target) if not is_youtube_url(target) else "download"
+        else:
+            if not ps["history"]:
+                say(status, "nothing playing to download")
+                return
+            target = ps["history"][-1][0]
+            lib = load_library()
+            entry = lib.get(target)
+            title = entry.get("title") if entry else os.path.basename(target)
+        threading.Thread(target=download_track, args=(target, title, status, out), daemon=True).start()
+        say(status, f"Download started for {title}", sticky=False)
 
     elif cmd == "tag" and arg:
         if not ps["loaded"]:
@@ -1608,6 +1649,8 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
             mpv.load(url)
             mirror_queue_to_mpv(mpv, ps["queue"])
             ps["loaded"] = True
+            ps["track_loaded_successfully"] = True
+            ps["manual_stop"] = False
             ps["name"] = disp
             ps["resolved"] = source_display(disp) if os.path.isabs(disp) else None
             mpv.set_title(ps["resolved"] or disp)
@@ -1618,6 +1661,8 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
             say(status, offline_brain("skip"))
         else:
             ps["loaded"] = False
+            ps["track_loaded_successfully"] = False
+            ps["manual_stop"] = False
             ps["name"] = None
             ps["resolved"] = None
             advance_empty_queue(mpv, ps, status)
@@ -1629,6 +1674,8 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
             mpv.load(url)
             mirror_queue_to_mpv(mpv, ps["queue"])
             ps["loaded"] = True
+            ps["track_loaded_successfully"] = True
+            ps["manual_stop"] = False
             ps["name"] = disp
             ps["resolved"] = source_display(disp) if os.path.isabs(disp) else None
             mpv.set_title(ps["resolved"] or disp)
@@ -1643,6 +1690,8 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
         mpv.cmd("playlist-clear")
         ps["queue"].clear()
         ps["loaded"] = False
+        ps["track_loaded_successfully"] = False
+        ps["manual_stop"] = True
         ps["name"] = None
         ps["resolved"] = None
         ui["list_until"] = 0.0
@@ -1659,7 +1708,6 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
     elif cmd == "clear":
         sub = arg.strip().lower()
         if sub == "queue":
-            # Clear mpv's playlist after the current track and our internal queue
             try:
                 playlist = mpv.prop("playlist")
                 cur_pos = mpv.prop("playlist-pos")
@@ -1671,13 +1719,11 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
             except Exception as e:
                 say(status, f"Error clearing queue: {e}")
         elif sub == "list":
-            # Clear only the temporary list overlay
             ui["list_until"] = 0.0
             ui["list_lines"] = []
             ui["list_items"] = []
             say(status, "List cleared.")
         else:
-            # Original clear: status, list, help all gone
             status.clear()
             ui["list_until"] = 0.0
             ui["list_lines"] = []
@@ -1712,97 +1758,100 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
                 target=ollama_worker, args=(raw, out, width), daemon=True)
             ai["thread"].start()
 
-
 # ─────────────────────────── main loop ───────────────────────────
 def advance_empty_queue(mpv, ps, status):
-    """Nothing left in ps['queue'] — either a track finished naturally or an
-    external control (KDE Connect / MPRIS 'skip') stopped playback. Flip a
-    coin between fetching related videos ('rec') and a plain library shuffle."""
-
-    def do_shuffle():
-        lib = load_library()
-        blacklist = load_blacklist()
-        if lib:
-            items = [(u, v) for u, v in lib.items() if u not in blacklist]
-            with _QUEUE_LOCK:
-                if len(items) > 1 and ps["history"]:
-                    cur = ps["history"][-1][0]
-                    filtered = [(u, v) for u, v in items if u != cur]
-                    if filtered:
-                        items = filtered
-            if items:
-                url, meta = random.choice(items)
-                title = meta.get("title") or url
-                mpv.load(url)
-                mpv.set_title(title)
-                mpv.cmd("set", "pause", False)
-                ps["loaded"] = True
-                ps["name"] = title
-                ps["resolved"] = title
+    with _ADVANCE_LOCK:
+        def do_shuffle():
+            lib = load_library()
+            blacklist = load_blacklist()
+            if lib:
+                items = [(u, v) for u, v in lib.items() if u not in blacklist]
                 with _QUEUE_LOCK:
-                    ps["history"].append((url, title))
-                remember(url, title)
-                say(status, "Shuffling...")
+                    if len(items) > 1 and ps["history"]:
+                        cur = ps["history"][-1][0]
+                        filtered = [(u, v) for u, v in items if u != cur]
+                        if filtered:
+                            items = filtered
+                if items:
+                    url, meta = random.choice(items)
+                    title = meta.get("title") or url
+                    mpv.load(url)
+                    mpv.set_title(title)
+                    mpv.cmd("set", "pause", False)
+                    ps["loaded"] = True
+                    ps["track_loaded_successfully"] = True
+                    ps["manual_stop"] = False
+                    ps["name"] = title
+                    ps["resolved"] = title
+                    with _QUEUE_LOCK:
+                        ps["history"].append((url, title))
+                    remember(url, title)
+                    say(status, "Shuffling...")
+                else:
+                    ps["loaded"] = False
+                    ps["track_loaded_successfully"] = False
+                    ps["manual_stop"] = False
+                    ps["name"] = None
+                    ps["resolved"] = None
+                    say(status, "stopped (no non-blacklisted tracks)")
             else:
                 ps["loaded"] = False
+                ps["track_loaded_successfully"] = False
+                ps["manual_stop"] = False
                 ps["name"] = None
                 ps["resolved"] = None
-                say(status, "stopped (no non-blacklisted tracks)")
-        else:
-            ps["loaded"] = False
-            ps["name"] = None
-            ps["resolved"] = None
-            say(status, "stopped (no queue, no library)")
+                say(status, "stopped (no queue, no library)")
 
-    cur_url = ps["history"][-1][0] if ps["history"] else None
-    if can_recommend_from(cur_url) and random.random() < 0.45:
-        say(status, "Auto-recommending...", sticky=False)
+        cur_url = ps["history"][-1][0] if ps["history"] else None
+        if can_recommend_from(cur_url) and random.random() < 0.45:
+            say(status, "Auto-recommending...", sticky=False)
 
-        def fetch_and_play():
-            try:
-                urls, reason = get_related_videos(cur_url, limit=11)
+            def fetch_and_play():
                 try:
-                    with open(os.path.expanduser("~/.crescent_rec_debug.log"), "a") as dbg:
-                        dbg.write(f"{time.ctime()} | auto | url={cur_url!r} "
-                                  f"| urls_found={len(urls)} | reason={reason!r}\n")
-                except Exception:
-                    pass
-                with _QUEUE_LOCK:
-                    urls = [u for u in urls
-                            if not any(u == q[0] for q in ps["queue"])
-                            and not any(u == h[0] for h in ps["history"])]
-                if not urls:
-                    why = f" ({reason})" if reason else ""
-                    say(status, f"No related videos found{why}. Shuffling instead.", sticky=False)
-                    do_shuffle()
-                    return
-                first, rest = urls[0], urls[1:]
-                mpv.load(first)
-                mpv.set_title(first)
-                mpv.cmd("set", "pause", False)
-                ps["loaded"] = True
-                ps["name"] = first
-                ps["resolved"] = None
-                with _QUEUE_LOCK:
-                    ps["history"].append((first, first))
-                remember(first, first)
-                with _QUEUE_LOCK:
-                    for u in rest:
-                        ps["queue"].append((u, u))
-                    queue_snapshot = list(ps["queue"])
-                mirror_queue_to_mpv(mpv, queue_snapshot)
-                if not os.path.isabs(first):
-                    start_resolve(first, ps, status, mpv)
-                say(status, f"Recommended: {first}", sticky=False)
-            except Exception as e:
-                log_bg_error("fetch_and_play")
-                err = str(e).replace("\n", " ").strip()[:150]
-                say(status, f"error fetching recommendation: {err} (see ~/.crescent_rec_debug.log)", sticky=False)
+                    urls, reason = get_related_videos(cur_url, limit=11)
+                    try:
+                        with open(os.path.expanduser("~/.crescent_rec_debug.log"), "a") as dbg:
+                            dbg.write(f"{time.ctime()} | auto | url={cur_url!r} "
+                                      f"| urls_found={len(urls)} | reason={reason!r}\n")
+                    except Exception:
+                        pass
+                    with _QUEUE_LOCK:
+                        urls = [u for u in urls
+                                if not any(u == q[0] for q in ps["queue"])
+                                and not any(u == h[0] for h in ps["history"])]
+                    if not urls:
+                        why = f" ({reason})" if reason else ""
+                        say(status, f"No related videos found{why}. Shuffling instead.", sticky=False)
+                        do_shuffle()
+                        return
+                    first, rest = urls[0], urls[1:]
+                    mpv.load(first)
+                    mpv.set_title(first)
+                    mpv.cmd("set", "pause", False)
+                    ps["loaded"] = True
+                    ps["track_loaded_successfully"] = True
+                    ps["manual_stop"] = False
+                    ps["name"] = first
+                    ps["resolved"] = None
+                    with _QUEUE_LOCK:
+                        ps["history"].append((first, first))
+                    remember(first, first)
+                    with _QUEUE_LOCK:
+                        for u in rest:
+                            ps["queue"].append((u, u))
+                        queue_snapshot = list(ps["queue"])
+                    mirror_queue_to_mpv(mpv, queue_snapshot)
+                    if not os.path.isabs(first):
+                        start_resolve(first, ps, status, mpv)
+                    say(status, f"Recommended: {first}", sticky=False)
+                except Exception as e:
+                    log_bg_error("fetch_and_play")
+                    err = str(e).replace("\n", " ").strip()[:150]
+                    say(status, f"error fetching recommendation: {err} (see ~/.crescent_rec_debug.log)", sticky=False)
 
-        threading.Thread(target=fetch_and_play, daemon=True).start()
-    else:
-        do_shuffle()
-
+            threading.Thread(target=fetch_and_play, daemon=True).start()
+        else:
+            do_shuffle()
 
 def main(scr):
     curses.curs_set(1)
@@ -1820,7 +1869,7 @@ def main(scr):
         curses.init_pair(2, 244, -1)
         curses.init_pair(3, 240, -1)
         curses.init_pair(4, 250, -1)
-        curses.init_pair(5, 231, -1)   # brightest white — offline "chat" replies pop here
+        curses.init_pair(5, 231, -1)
     else:
         curses.init_pair(1, curses.COLOR_WHITE, -1)
         curses.init_pair(2, curses.COLOR_WHITE, -1)
@@ -1830,7 +1879,7 @@ def main(scr):
 
     mpv = Mpv()
     mpv.enable_audio_meter()
-    ps = {"queue": [], "loaded": False, "name": None, "resolved": None, "history": []}
+    ps = {"queue": [], "loaded": False, "track_loaded_successfully": False, "manual_stop": False, "name": None, "resolved": None, "history": []}
     status = []
     out = queue.Queue()
     ai = {"thread": None}
@@ -1922,6 +1971,8 @@ def main(scr):
                         if steps:
                             url, disp = ps["history"][-1]
                             ps["loaded"] = True
+                            ps["track_loaded_successfully"] = True
+                            ps["manual_stop"] = False
                             ps["name"] = disp
                             ps["resolved"] = source_display(disp) if os.path.isabs(disp) else title
                             mpv.set_title(ps["resolved"] or disp)
@@ -1933,6 +1984,8 @@ def main(scr):
                             url, disp = ps["history"][target_index]
                             ps["history"] = ps["history"][:target_index + 1]
                             ps["loaded"] = True
+                            ps["track_loaded_successfully"] = True
+                            ps["manual_stop"] = False
                             ps["name"] = disp
                             ps["resolved"] = source_display(disp) if os.path.isabs(disp) else title
                             mpv.set_title(ps["resolved"] or disp)
@@ -1943,33 +1996,64 @@ def main(scr):
                 if current_path:
                     last_path = current_path
                     last_loaded_url = current_path
+                    if ps["loaded"] and not ps["track_loaded_successfully"]:
+                        ps["track_loaded_successfully"] = True
+                        debug_log(f"Track loaded successfully: {current_path}")
                 if playlist_pos is not None:
                     last_playlist_pos = playlist_pos
 
-                if mpv.prop("eof-reached") and ps["loaded"]:
-                    ps["loaded"] = False
-                    if ps["queue"]:
-                        url, disp = ps["queue"].pop(0)
-                        mpv.load(url)
-                        mirror_queue_to_mpv(mpv, ps["queue"])
-                        mpv.set_title(disp)
-                        ps["loaded"] = True
-                        ps["name"] = disp
-                        ps["resolved"] = None
-                        ps["history"].append((url, disp))
-                        remember(url, source_display(disp) if os.path.isabs(disp) else disp)
-                        if not os.path.isabs(url):
-                            start_resolve(url, ps, status, mpv)
-                        say(status, f"next: {disp}")
-                    else:
-                        advance_empty_queue(mpv, ps, status)
-                    idle_ticks = 0
-                elif ps["loaded"] and not ps["queue"] and not current_path:
-                    idle_ticks += 1
-                    if idle_ticks >= 2:
+                # EOF handling with manual_stop and time-pos check
+                if mpv.prop("eof-reached") and ps["loaded"] and not paused:
+                    time_pos = mpv.prop("time-pos")
+                    playback_started = time_pos is not None and time_pos > 0.0
+
+                    if ps["manual_stop"]:
+                        debug_log("Manual stop, suppressing auto-advance")
                         ps["loaded"] = False
-                        idle_ticks = 0
-                        advance_empty_queue(mpv, ps, status)
+                        ps["manual_stop"] = False
+                        ps["name"] = None
+                        ps["resolved"] = None
+                    elif not ps["track_loaded_successfully"] or not playback_started:
+                        error_msg = mpv.get_last_error()
+                        debug_log(f"Playback failed. Error: {error_msg[:200]}")
+                        say(status, f"Playback failed: {error_msg[:80]}...", sticky=True)
+                        ps["loaded"] = False
+                        ps["track_loaded_successfully"] = False
+                    else:
+                        ps["loaded"] = False
+                        if ps["queue"]:
+                            url, disp = ps["queue"].pop(0)
+                            mpv.load(url)
+                            mirror_queue_to_mpv(mpv, ps["queue"])
+                            mpv.set_title(disp)
+                            ps["loaded"] = True
+                            ps["track_loaded_successfully"] = False
+                            ps["manual_stop"] = False
+                            ps["name"] = disp
+                            ps["resolved"] = None
+                            ps["history"].append((url, disp))
+                            remember(url, source_display(disp) if os.path.isabs(disp) else disp)
+                            if not os.path.isabs(url):
+                                start_resolve(url, ps, status, mpv)
+                            say(status, f"next: {disp}")
+                        else:
+                            advance_empty_queue(mpv, ps, status)
+                    idle_ticks = 0
+                elif ps["loaded"] and not ps["queue"] and not current_path and not paused:
+                    if ps["track_loaded_successfully"]:
+                        idle_ticks += 1
+                        if idle_ticks >= 5:
+                            ps["loaded"] = False
+                            idle_ticks = 0
+                            advance_empty_queue(mpv, ps, status)
+                    else:
+                        idle_ticks += 1
+                        if idle_ticks >= 10:
+                            debug_log("Track never loaded, giving up")
+                            ps["loaded"] = False
+                            ps["track_loaded_successfully"] = False
+                            idle_ticks = 0
+                            say(status, "Playback failed (no stream)", sticky=True)
                 else:
                     idle_ticks = 0
 
@@ -2044,7 +2128,7 @@ def main(scr):
             elif now < ui["help_until"]:
                 help_lines = [
                     "commands:",
-                    "  play <url|search> · shuffle [genre] · list · info · tag <genre>",
+                    "  play <url|search> · shuffle [genre] · list · info · dl [url] · tag <genre>",
                     "  pause · skip · back · stop · vol <n> · ask · clear · clear list · clear queue · exit",
                 ]
                 for i, line in enumerate(help_lines):
@@ -2085,10 +2169,8 @@ def main(scr):
     finally:
         mpv.p.terminate()
 
-
 if __name__ == "__main__":
     if "--help" in sys.argv or "-h" in sys.argv:
         print(USAGE)
         sys.exit(0)
-    # Ensure mpv exists before starting (already checked above)
     curses.wrapper(main)
