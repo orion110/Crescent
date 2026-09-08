@@ -85,16 +85,15 @@ commands:
   shuffle <genre>      stop current and play a shuffled remembered track of that genre
   list                 show recently played tracks
   count                show how many links are remembered
-  info                 show detailed metadata for current track (incl. URL)
-  dl [url]             download current track (or specified URL) as MP3
+  info                 show detailed metadata for current track (incl. URL) [auto‑clears in 10s]
+  dl [url]             download current track (or specified URL) as MP3 to ~/Music/Crescent/
   tag <genre>          tag the current track with a genre
   genres               list all genres in the library with track counts
   recommend (rec)      fetch 5 related YouTube videos (falls back to shuffle if none)
   blacklist            add current track to blacklist (skip in shuffle)
   blacklist remove     remove current track from blacklist
-  delete <n>           delete item <n> from the list/count results
-  delete               delete the current track from the library
   remove all           wipe the entire remembered library
+  delete all           wipe the entire remembered library
   pause                pause playback
   play                 resume/unpause playback
   skip                 stop current track, play next in queue
@@ -105,7 +104,7 @@ commands:
   wave                 choose wave style
   help                 show commands
   clear                clear the status/text area
-  clear list           dismiss the displayed list only
+  clear list           clear the displayed list
   clear queue          remove all queued tracks (keep current playing)
   mpris                check whether MPRIS (KDE Connect etc.) is active
   exit                 quit
@@ -122,7 +121,7 @@ commands:
   from a remote widget acts on mpv's own playlist, not Crescent's
   queue, so use Crescent's own skip/back for queue-aware navigation."""
 
-# ─────────────────────────── mpv control (Termux audio fix + error capture) ───────────────────────────
+# ---- mpv control (Termux audio fix + error capture) ----
 class Mpv:
     def __init__(self):
         if os.path.exists(SOCK):
@@ -206,7 +205,7 @@ class Mpv:
                 return "Could not read stderr"
         return "No error captured"
 
-# ─────────────────────────── library & blacklist ───────────────────────────
+# ---- library & blacklist ----
 _LIB_LOCK = threading.Lock()
 _BLACKLIST_LOCK = threading.Lock()
 _QUEUE_LOCK = threading.Lock()
@@ -369,7 +368,7 @@ def fmt_dur(s):
     m, sec = divmod(rem, 60)
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
-# ─────────────────────────── metadata resolution ───────────────────────────
+# ---- metadata resolution ----
 def _meta_fields(info):
     if not isinstance(info, dict):
         return None
@@ -467,7 +466,7 @@ def start_resolve(url, ps, status=None, mpv=None):
 def is_url(s):
     return s.startswith("http://") or s.startswith("https://")
 
-# ─────────────────────────── related videos ───────────────────────────
+# ---- related videos ----
 def get_related_videos(video_url, limit=10):
     def extract_video_id(url):
         match = re.search(r"(?:v=|youtu\.be/|/v/|/embed/)([a-zA-Z0-9_-]{11})", url)
@@ -621,7 +620,7 @@ def get_related_videos(video_url, limit=10):
 
     return [], (last_error[0] or "all methods exhausted")
 
-# ─────────────────────────── ollama ───────────────────────────
+# ---- ollama ----
 def ollama_worker(prompt, out, width):
     try:
         req = urllib.request.Request(
@@ -635,9 +634,8 @@ def ollama_worker(prompt, out, width):
     for line in textwrap.wrap(text, width=max(20, width)) or ["(no output)"]:
         out.put(line)
 
-# ─────────────────────────── download helper ───────────────────────────
+# ---- download helper ----
 def download_track(url, title, status, out):
-    """Download audio from url to ~/Music/Crescent/ using yt-dlp."""
     if not shutil.which("yt-dlp"):
         say(status, "yt-dlp not installed. Please install it: pip install yt-dlp", sticky=True)
         return
@@ -657,14 +655,15 @@ def download_track(url, title, status, out):
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         stdout, stderr = proc.communicate()
         if proc.returncode == 0:
-            say(status, f"Download complete: {title} -> {dl_dir}", sticky=True)
+            abs_path = os.path.abspath(dl_dir)
+            say(status, f"Download complete: {title} -> {abs_path}", sticky=True)
         else:
             err = stderr.strip() or stdout.strip()
             say(status, f"Download failed: {err[:100]}", sticky=True)
     except Exception as e:
         say(status, f"Download error: {e}", sticky=True)
 
-# ─────────────────────────── commands ───────────────────────────
+# ---- commands ----
 def resolve(arg):
     return arg if is_url(arg) else "ytsearch1:" + arg
 
@@ -717,7 +716,7 @@ def offline_brain(event, value=""):
     }
     return messages.get(event, value or "Ready.")
 
-# ─────────────────────────── OFFLINE BRAIN ───────────────────────────
+# ---- OFFLINE BRAIN (full lists) ----
 import re as _re
 
 def _hit(c, triggers):
@@ -747,6 +746,7 @@ def _track_context(ps):
             artist = entry["channel"]
     return {"title": title, "genre": genre, "artist": artist}
 
+# --- GREETINGS ---
 GREETINGS = [
     "hey", "hi", "hello", "yo", "sup", "what's up", "whats up", "hiya", "howdy",
     "hey there", "hi there", "yo yo", "greetings", "morning", "good morning",
@@ -781,6 +781,7 @@ GREETING_REPLIES = [
     "Yo! {title} is on, and it's got that groove – you feel me?",
 ]
 
+# --- HOW ARE YOU ---
 HOW_ARE_YOU = [
     "how are you", "how r u", "you ok", "you good", "hows it going", "how's it going",
     "how you doing", "how are things", "how have you been", "you alright", "u good",
@@ -813,6 +814,7 @@ HOW_REPLIES = [
     "Never better – this beat from {title} is infectious. You?",
 ]
 
+# --- WEATHER ---
 WEATHER_TRIGGERS = [
     "weather", "rain", "raining", "sunny", "cloudy", "storm", "snow",
     "how's the weather", "is it raining", "what's the forecast",
@@ -837,6 +839,7 @@ WEATHER_REPLIES = [
     "Whether it's rain or shine, {title} always fits the mood.",
 ]
 
+# --- TIME ---
 TIME_TRIGGERS = [
     "what time", "time is", "what's the time", "tell me the time", "clock",
     "late", "early", "night", "morning", "afternoon", "evening",
@@ -858,6 +861,7 @@ TIME_REPLIES = [
     "It's always 'music o'clock' when {title} is on.",
 ]
 
+# --- MOOD ---
 MOOD_TRIGGERS = [
     "i feel", "i'm feeling", "feeling", "mood", "happy", "sad", "angry",
     "tired", "energized", "lonely", "chill", "anxious", "relaxed", "excited",
@@ -893,6 +897,7 @@ MOOD_REPLIES = [
     "In a mood? {title} will match whatever you're feeling – it's versatile.",
 ]
 
+# --- GENRE ---
 GENRE_TRIGGERS = [
     "recommend", "suggestion", "what should i listen", "give me a genre",
     "what genre", "genre", "what's good",
@@ -922,6 +927,7 @@ GENRE_REPLIES = [
     "Surprise yourself with {genre} – {title} is a wild ride.",
 ]
 
+# --- TRIVIA ---
 TRIVIA_TRIGGERS = [
     "fact", "did you know", "music trivia", "tell me something interesting",
     "interesting", "fun fact",
@@ -944,6 +950,7 @@ TRIVIA_REPLIES = [
     "Did you know? The theremin is the only instrument you play without touching – {title} has that same ethereal quality.",
 ]
 
+# --- VOLUME ---
 VOLUME_TRIGGERS = [
     "volume", "turn it up", "louder", "quieter", "turn it down", "mute",
     "vol", "sound",
@@ -963,6 +970,7 @@ VOLUME_REPLIES = [
     "Turn it down a notch? But {title} is so good!",
 ]
 
+# --- NIGHT ---
 NIGHT_TRIGGERS = [
     "good night", "night", "late", "bedtime", "sleep", "tired", "zzz",
 ]
@@ -979,6 +987,7 @@ NIGHT_REPLIES = [
     "Rest now – {title} is a gentle wave to carry you to dreamland.",
 ]
 
+# --- COMPLIMENTS ---
 COMPLIMENT_TRIGGERS = [
     "good job", "well done", "nice work", "youre great", "you're great",
     "good bot", "good ai", "you rock", "awesome", "you're awesome",
@@ -999,6 +1008,7 @@ COMPLIMENT_REPLIES = [
     "I love you too – and {title} is our anthem.",
 ]
 
+# --- INSULTS ---
 INSULT_TRIGGERS = [
     "youre dumb", "you're dumb", "you suck", "youre useless", "you're useless",
     "bad bot", "stupid", "you're stupid", "worst", "terrible",
@@ -1016,6 +1026,7 @@ INSULT_REPLIES = [
     "Haters gonna hate – but {title} is gonna play.",
 ]
 
+# --- YES/NO ---
 YES_TRIGGERS = ["yes", "yeah", "yep", "yup", "sure", "ok", "okay", "alright",
                 "sounds good", "correct", "right", "affirmative", "aye", "roger"]
 YES_REPLIES = [
@@ -1044,6 +1055,7 @@ NO_REPLIES = [
     "Not today? – {title} will be here when you're ready.",
 ]
 
+# --- THANKS ---
 THANKS_TRIGGERS = ["thanks", "thank you", "thx", "ty", "appreciate it", "cheers", "much obliged"]
 THANKS_REPLIES = [
     "Anytime! That's what I'm here for. – enjoy {title}!",
@@ -1056,6 +1068,7 @@ THANKS_REPLIES = [
     "Thanks for the kind words – {title} is the real star.",
 ]
 
+# --- FAREWELL ---
 FAREWELL_TRIGGERS = [
     "bye", "goodbye", "see ya", "see you", "later", "cya", "gtg", "gotta go",
     "im out", "i'm out", "peace", "night", "goodnight", "good night",
@@ -1074,6 +1087,7 @@ FAREWELL_REPLIES = [
     "Until next time – {title} is on repeat for you.",
 ]
 
+# --- JOKES ---
 JOKE_TRIGGERS = ["tell me a joke", "say something funny", "make me laugh", "joke", "funny"]
 JOKE_REPLIES = [
     "Why did the DJ get locked out? Left the keys in the mix. – but {title} is still playing.",
@@ -1090,6 +1104,7 @@ JOKE_REPLIES = [
     "Why did the beat drop? Because it was too heavy to hold. – just like the drop in {title}.",
 ]
 
+# --- BANTER ---
 BANTER_TRIGGERS = [
     "you're cute", "you're beautiful", "handsome", "pretty", "cool",
     "what's your favorite", "favorite", "like", "dislike",
@@ -1107,6 +1122,7 @@ BANTER_REPLIES = [
     "What's my favorite? This one – {title} – it's amazing.",
 ]
 
+# --- TRACK STATUS ---
 TRACK_TRIGGERS = [
     "what is this", "what's playing", "current track", "now playing",
     "who is this", "artist", "song title",
@@ -1119,6 +1135,7 @@ def track_reply(ps):
             return f"You're listening to '{ctx['title']}'{artist}. Pretty sweet, right? The {ctx['genre']} vibes are strong!"
     return "Nothing's playing at the moment – queued something up? I'm ready!"
 
+# --- CATCH-ALL ---
 CATCHALL_REPLIES = [
     "Not sure I follow, but I'm here. Want me to queue {title} again?",
     "I'm more of a music brain than a conversation brain. Try 'shuffle' or 'recommend' – {title} is a good start.",
@@ -1137,6 +1154,7 @@ CATCHALL_REPLIES = [
     "Let's not overthink – {title} is the answer.",
 ]
 
+# --- AMBIENT LINES (used in main loop) ---
 AMBIENT_LINES = [
     "Enjoying {title}? What's your favorite part so far?",
     "This one's got a nice groove – {title} is proof. Are you a fan of {genre}?",
@@ -1287,7 +1305,7 @@ def offline_reply(prompt, ps=None):
             return chosen
     return None
 
-# ─────────────────────────── ui helpers ───────────────────────────
+# ---- ui helpers ----
 def put(scr, y, x, text, attr):
     try:
         scr.addnstr(y, x, text, max(0, curses.COLS - x - 1), attr)
@@ -1573,8 +1591,9 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
                     lines.append("Source: YouTube search")
                 else:
                     lines.append("Source: Unknown")
-                full = "\n".join(lines)
-                say(status, full, sticky=True)
+                ui["list_lines"] = lines
+                ui["list_items"] = []
+                ui["list_until"] = time.time() + 10
 
     elif cmd == "dl":
         if arg:
@@ -1600,38 +1619,15 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
     elif cmd == "tag":
         say(status, "usage: tag <genre>")
 
-    elif cmd in ("delete", "remove") and arg.strip().lower() == "all":
+    elif cmd in ("remove", "delete") and arg.strip().lower() == "all":
         n = forget_all()
         ui["list_until"] = 0.0
+        ui["list_lines"] = []
+        ui["list_items"] = []
         if n:
             say(status, f"removed all {n} track(s) from the library")
         else:
             say(status, "library was already empty")
-
-    elif cmd == "delete" and arg.strip().isdigit() and ui["list_items"] and time.time() < ui["list_until"]:
-        idx = int(arg.strip()) - 1
-        if 0 <= idx < len(ui["list_items"]):
-            url, title = ui["list_items"][idx]
-            ui["list_until"] = 0.0
-            if forget(url):
-                say(status, f"deleted: {title}")
-            else:
-                say(status, f"already gone: {title}")
-        else:
-            say(status, f"no item #{arg.strip()} in the list")
-
-    elif cmd == "delete" and not arg:
-        if not ps["history"]:
-            say(status, "nothing playing to delete")
-        else:
-            url, title = ps["history"][-1]
-            if forget(url):
-                say(status, f"deleted: {title}")
-            else:
-                say(status, "not in the library")
-
-    elif cmd == "delete":
-        say(status, "usage: delete <n> (from list/count) · remove all (wipes library) · delete with nothing playing removes current track")
 
     elif cmd in ("play", "p"):
         if ps["loaded"]:
@@ -1639,9 +1635,11 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
             say(status, "Resumed.")
         else:
             say(status, "usage: play <url, search, file, or folder>")
+
     elif cmd == "pause":
         mpv.cmd("set", "pause", True)
         say(status, offline_brain("pause"))
+
     elif cmd == "skip":
         mpv.cmd("stop")
         if ps["queue"]:
@@ -1665,11 +1663,12 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
             ps["manual_stop"] = False
             ps["name"] = None
             ps["resolved"] = None
-            advance_empty_queue(mpv, ps, status)
+            say(status, "Stopped (queue empty)")
+
     elif cmd in ("reverse", "back", "prev", "previous"):
         mpv.cmd("stop")
         if len(ps["history"]) >= 2:
-            ps["history"].pop()
+            skipped_url, skipped_disp = ps["history"].pop()
             url, disp = ps["history"][-1]
             mpv.load(url)
             mirror_queue_to_mpv(mpv, ps["queue"])
@@ -1682,9 +1681,12 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
             remember(url, source_display(disp) if os.path.isabs(disp) else disp)
             if not os.path.isabs(url):
                 start_resolve(url, ps, status, mpv)
+            ps["queue"].insert(0, (skipped_url, skipped_disp))
+            mirror_queue_to_mpv(mpv, ps["queue"])
             say(status, offline_brain("reverse"))
         else:
             say(status, "no previous track")
+
     elif cmd == "stop":
         mpv.cmd("stop")
         mpv.cmd("playlist-clear")
@@ -1696,6 +1698,7 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
         ps["resolved"] = None
         ui["list_until"] = 0.0
         say(status, offline_brain("stop"))
+
     elif cmd == "vol" and arg.isdigit():
         mpv.cmd("set", "volume", arg)
         say(status, f"volume {arg}")
@@ -1758,7 +1761,7 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
                 target=ollama_worker, args=(raw, out, width), daemon=True)
             ai["thread"].start()
 
-# ─────────────────────────── main loop ───────────────────────────
+# ---- main loop ----
 def advance_empty_queue(mpv, ps, status):
     with _ADVANCE_LOCK:
         def do_shuffle():
@@ -2002,7 +2005,6 @@ def main(scr):
                 if playlist_pos is not None:
                     last_playlist_pos = playlist_pos
 
-                # EOF handling with manual_stop and time-pos check
                 if mpv.prop("eof-reached") and ps["loaded"] and not paused:
                     time_pos = mpv.prop("time-pos")
                     playback_started = time_pos is not None and time_pos > 0.0
@@ -2129,7 +2131,7 @@ def main(scr):
                 help_lines = [
                     "commands:",
                     "  play <url|search> · shuffle [genre] · list · info · dl [url] · tag <genre>",
-                    "  pause · skip · back · stop · vol <n> · ask · clear · clear list · clear queue · exit",
+                    "  remove all · delete all · clear list · pause · skip · back · stop · vol <n> · ask · exit",
                 ]
                 for i, line in enumerate(help_lines):
                     put(scr, ROW_STATUS + i, 2, line, curses.color_pair(4))
