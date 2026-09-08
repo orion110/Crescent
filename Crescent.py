@@ -1,9 +1,23 @@
 #!/usr/bin/env python3
 # Crescent.py — terminal YouTube Crescent · grey/white theme · mpv · queue · ollama `ask`
 # command-driven terminal interface
-import curses, json, os, queue, random, re, socket, subprocess, sys, textwrap, threading, time, urllib.request, urllib.parse
+import curses, json, os, queue, random, re, socket, subprocess, sys, textwrap, threading, time, urllib.request, urllib.parse, shutil
 
-SOCK       = "/tmp/play-mpv.sock"
+# ---- Termux detection & environment ----
+IS_TERMUX = os.environ.get("TERMUX_VERSION") is not None
+TMPDIR = os.environ.get("TMPDIR", "/tmp")
+SOCK = os.path.join(TMPDIR, "play-mpv.sock")
+
+# ---- Binary checks ----
+def check_binary(name):
+    if shutil.which(name) is None:
+        sys.exit(f"ERROR: required program '{name}' not found in PATH.\n"
+                 f"On Termux, install it with: pkg install {name}\n"
+                 f"(or for yt-dlp, also try: pip install yt-dlp)")
+check_binary("mpv")
+# yt-dlp is optional if we have the Python module, but we try to use it first.
+# The script will fall back to the module if the binary is missing.
+
 OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 MODEL      = "qwen2:0.5b"      # <- change to any model from `ollama list`
 DEBUG      = False             # <- set True to show the [debug] line
@@ -142,23 +156,29 @@ class Mpv:
             self.cmd("set_property", "force-media-title", title)
 
     def enable_audio_meter(self):
-        self.cmd("af", "add", "@vis:lavfi=[astats=metadata=1:reset=1]")
+        try:
+            self.cmd("af", "add", "@vis:lavfi=[astats=metadata=1:reset=1]")
+        except Exception:
+            pass  # ignore failure (e.g., on Termux where lavfi may not be available)
 
     def level(self):
-        data = self.prop("af-metadata/vis")
-        if not data:
+        try:
+            data = self.prop("af-metadata/vis")
+            if not data:
+                return None
+            readings = []
+            for k, v in data.items():
+                if k.endswith("RMS_level"):
+                    try:
+                        readings.append(float(v))
+                    except (TypeError, ValueError):
+                        pass
+            if not readings:
+                return None
+            db = sum(readings) / len(readings)
+            return max(0.0, min(1.0, (db + 60.0) / 60.0))
+        except Exception:
             return None
-        readings = []
-        for k, v in data.items():
-            if k.endswith("RMS_level"):
-                try:
-                    readings.append(float(v))
-                except (TypeError, ValueError):
-                    pass
-        if not readings:
-            return None
-        db = sum(readings) / len(readings)
-        return max(0.0, min(1.0, (db + 60.0) / 60.0))
 
     def alive(self):
         return self.p.poll() is None
@@ -380,6 +400,9 @@ def _meta_from_cli(url):
     last_err = None
     for binary in candidates:
         try:
+            # Skip if binary doesn't exist (for shell commands)
+            if isinstance(binary, list) and binary[0] not in ("yt-dlp", "youtube-dl") and not shutil.which(binary[0]):
+                continue
             m = _run_get_meta(binary, url)
             if m:
                 return m
@@ -391,7 +414,10 @@ def _meta_from_cli(url):
     return None
 
 def _meta_from_module(url):
-    import yt_dlp
+    try:
+        import yt_dlp
+    except ImportError:
+        return None
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True,
             "default_search": "ytsearch1"}
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -477,6 +503,10 @@ def get_related_videos(video_url, limit=10):
     last_error = [""]
 
     def run(cmd, timeout=20):
+        # Ensure the command exists
+        if isinstance(cmd, list) and cmd[0] not in ("yt-dlp", "youtube-dl") and not shutil.which(cmd[0]):
+            last_error[0] = f"{cmd[0]} not found"
+            return ""
         if COOKIES_FILE:
             cmd = cmd[:1] + ["--cookies", COOKIES_FILE] + cmd[1:]
         try:
@@ -680,7 +710,27 @@ def _hit(c, triggers):
             return True
     return False
 
-# --- GREETINGS (expanded) ---
+def _track_context(ps):
+    """Return a dict with title, genre, artist for the current track, or None."""
+    if not ps or not ps.get("history"):
+        return None
+    url, _ = ps["history"][-1]
+    lib = load_library()
+    entry = lib.get(url)
+    title = ps.get("name") or ps.get("resolved") or "this track"
+    genre = "music"
+    artist = ""
+    if entry:
+        if entry.get("title"):
+            title = entry["title"]
+        genres = entry.get("genres", [])
+        if genres:
+            genre = genres[0]
+        if entry.get("channel"):
+            artist = entry["channel"]
+    return {"title": title, "genre": genre, "artist": artist}
+
+# --- GREETINGS ---
 GREETINGS = [
     "hey", "hi", "hello", "yo", "sup", "what's up", "whats up", "hiya", "howdy",
     "hey there", "hi there", "yo yo", "greetings", "morning", "good morning",
@@ -693,24 +743,29 @@ GREETINGS = [
     "how do you do", "top of the morning", "hey buddy", "hi buddy",
 ]
 GREETING_REPLIES = [
-    "Hey! What's the vibe today?",
-    "Yo! Ready to drop some beats?",
-    "Hi there! Got a track in mind?",
-    "Hello! I've been queuing tunes while you were away.",
-    "Sup! Let's make some noise.",
-    "Ahoy, music explorer! New horizons await.",
-    "Howdy! The waveforms are itching to dance.",
-    "Greetings, human. Shall we spin something good?",
-    "Heya! I'm all ears (metaphorically).",
-    "Yo! The playlist is your canvas.",
-    "Morning! Hope you've got caffeine and a good ear.",
-    "Evening! Time for the chill zone.",
-    "G'day! Let's find your next obsession.",
-    "Hola! Ready to rumble with some rhythm?",
-    "What's good? I'm ready to serve up some sonic gold.",
+    "Hey! Listening to {title}? That's a killer choice!",
+    "Yo! How's that {genre} track treating you?",
+    "Hi there! {title} is pure fire, am I right?",
+    "Hello! I was just vibing to {title} – glad you're here.",
+    "Sup! {title} has been keeping me company – it's a banger.",
+    "Ahoy! Ready to dive into {title} again? Let's go!",
+    "Howdy! The {genre} vibes are strong with {title} – feel it?",
+    "Greetings, human. {title} is playing – care to join the party?",
+    "Heya! I'm all ears, and {title} is on right now – loving it!",
+    "Yo! The playlist is your canvas – {title} is a masterpiece.",
+    "Morning! Hope you've got caffeine and {title} in your ears – perfect combo.",
+    "Evening! Time for some {genre} with {title} – let's unwind.",
+    "G'day! Let's find your next obsession – {title} is a keeper!",
+    "Hola! Ready to rumble with {title}? It's got a great rhythm.",
+    "What's good? I'm ready to serve up {title} again – it's that good.",
+    "Hey friend! {title} is playing – I think you'll dig this one.",
+    "Sup! This {genre} track is giving me life – {title} is the real deal.",
+    "Howdy! The bass on {title} is shaking my circuits – awesome!",
+    "Greetings! {title} is the soundtrack to this moment – enjoy!",
+    "Yo! {title} is on, and it's got that groove – you feel me?",
 ]
 
-# --- HOW ARE YOU (expanded) ---
+# --- HOW ARE YOU ---
 HOW_ARE_YOU = [
     "how are you", "how r u", "you ok", "you good", "hows it going", "how's it going",
     "how you doing", "how are things", "how have you been", "you alright", "u good",
@@ -721,18 +776,26 @@ HOW_ARE_YOU = [
     "how you feeling", "how are you feeling", "you holding up",
 ]
 HOW_REPLIES = [
-    "Chill as a vinyl record on a lazy Sunday. You?",
-    "Floating on a waveform of pure chill. You?",
-    "All good – the bass is warm and the treble is crisp. You?",
-    "I'm just vibing, thanks for asking. You?",
-    "Living the dream, one track at a time. You?",
-    "Great now that you're here. What's on your mind?",
-    "I'm thriving – the music never stops. You?",
-    "Feeling like a million hertz. You?",
-    "Can't complain – I'm surrounded by good tunes. You?",
-    "I'm the happiest ghost in the machine. You?",
-    "Pretty good – the silence between tracks is a nice break. You?",
-    "Better now that you're asking. What about you?",
+    "Chill as a vinyl record on a lazy Sunday – especially with {title} playing. You?",
+    "Floating on a waveform of pure chill – {title} helps. You?",
+    "All good – the bass is warm, the treble crisp, and {title} is on. You?",
+    "I'm just vibing to {title}, thanks for asking. You?",
+    "Living the dream, one track at a time – right now it's {title}. You?",
+    "Great now that you're here – and {title} is the soundtrack. You?",
+    "I'm thriving – the music never stops, and {title} is a banger. You?",
+    "Feeling like a million hertz – {title} is giving me life. You?",
+    "Can't complain – I'm surrounded by good tunes, like {title}. You?",
+    "I'm the happiest ghost in the machine, jamming to {title}. You?",
+    "Pretty good – the silence between tracks is a nice break, but {title} is better. You?",
+    "Better now that you're asking – and {title} is making it even better. What about you?",
+    "I'm on cloud nine, thanks to {title} – you?",
+    "Couldn't be better – {title} is my current anthem. You?",
+    "I'm in my element – {title} is the perfect vibe. You?",
+    "Feeling fantastic – this {genre} track is doing wonders. You?",
+    "I'm alive and kicking – {title} keeps me going. You?",
+    "All systems go – {title} is the energy boost I needed. You?",
+    "I'm in the zone – {title} is the soundtrack to my existence. You?",
+    "Never better – this beat from {title} is infectious. You?",
 ]
 
 # --- WEATHER ---
@@ -743,13 +806,21 @@ WEATHER_TRIGGERS = [
     "windy", "humid", "overcast", "temperature outside",
 ]
 WEATHER_REPLIES = [
-    "Weather? I just check the mood of the music – seems mostly cloudy with a chance of bass.",
-    "Not sure about outside, but in here it's always a perfect 72°F with a gentle breeze of lofi.",
-    "Raining? Perfect time for some ambient or rain sounds. I can queue it if you want.",
-    "Sunny? That calls for upbeat indie or tropical house.",
-    "Stormy outside? Time to crank some heavy metal or drum and bass.",
-    "I'm a digital being – I only feel the weather through the heat of the CPU.",
-    "Weather is a social construct. But if it's raining, I'll play you 'Riders on the Storm'.",
+    "Weather? I just check the mood of the music – {title} says it's mostly cloudy with a chance of bass.",
+    "Not sure about outside, but in here it's always a perfect 72°F with a gentle breeze of {genre} from {title}.",
+    "Raining? Perfect time for some {genre} – {title} fits right in, like raindrops on a window.",
+    "Sunny? That calls for upbeat vibes – {title} is a great match for the sunshine!",
+    "Stormy outside? Time to crank up {title} – it's got enough energy to power through.",
+    "I'm a digital being – I only feel the weather through the heat of the CPU. But {title} keeps me cool.",
+    "Weather is a social construct. But if it's raining, I'll play you {title} – it's like a rain dance.",
+    "Cold outside? {title} will warm you up with its {genre} goodness.",
+    "Hot outside? Let {title} be your cool breeze – it's refreshing.",
+    "Windy? {title} will blow you away – in a good way!",
+    "Humid? This {genre} track will dry you out with its crisp beats.",
+    "Overcast? {title} brings the sunshine, even if the sky doesn't.",
+    "The forecast calls for a high chance of {genre} – {title} is on the way.",
+    "I don't need a weatherman – I just listen to {title} to know it's a good day.",
+    "Whether it's rain or shine, {title} always fits the mood.",
 ]
 
 # --- TIME ---
@@ -758,11 +829,20 @@ TIME_TRIGGERS = [
     "late", "early", "night", "morning", "afternoon", "evening",
 ]
 TIME_REPLIES = [
-    "Time is just a number, but if you insist, it's currently {}. (I made that up.)",
-    "I don't have a clock, but I know it's always the right time for music.",
-    "The best time is now – unless you're asking for the actual time, in which case, check your phone.",
-    "Time flies when you're listening to good tracks.",
-    "It's {} o'clock somewhere – let's play something to match.",
+    "Time is just a number, but if you insist, it's currently {}. (I made that up.) – anyway, {title} is timeless.",
+    "I don't have a clock, but I know it's always the right time for {title}.",
+    "The best time is now – unless you're asking for the actual time, in which case, check your phone. Meanwhile, {title} is on.",
+    "Time flies when you're listening to {title} – it's that good.",
+    "It's {} o'clock somewhere – let's play something to match. {title} works.",
+    "Time is relative – but {title} is absolute perfection.",
+    "Who needs a watch when you have {title}? It's always the right moment.",
+    "Late? Perfect – {title} is a night owl's anthem.",
+    "Early morning? {title} is the perfect wake-up call.",
+    "Afternoon slump? {title} will energize you.",
+    "Evening unwind – {title} is the soundtrack to relaxation.",
+    "I've lost track of time – {title} does that to me.",
+    "Time stops when {title} plays – it's that immersive.",
+    "It's always 'music o'clock' when {title} is on.",
 ]
 
 # --- MOOD / FEELINGS ---
@@ -774,20 +854,31 @@ MOOD_TRIGGERS = [
     "annoyed", "frustrated", "peaceful", "calm", "in a mood", "not in the mood",
 ]
 MOOD_REPLIES = [
-    "Feeling happy? Let's keep that vibe with some funky disco or house.",
-    "Sad? I've got the perfect melancholic piano piece for you.",
-    "Angry? Let it out with some heavy riffs – metal or punk incoming.",
-    "Tired? Ambient or lo-fi will wrap you in a blanket of sound.",
-    "Energized? Time for some high‑BPM drum and bass!",
-    "Lonely? I'm here, and I'll queue up some warm, soulful vocals.",
-    "Chill? Perfect – we'll keep it mellow with some downtempo.",
-    "Anxious? Let's slow it down with some soft acoustic or classical.",
-    "Relaxed? You're already in the zone – just ride the wave.",
-    "Excited? Let's keep that energy with some upbeat rock or EDM.",
-    "Bored? Let's explore something weird – experimental or world music.",
-    "Nostalgic? I've got a crate of oldies just waiting for you.",
-    "Hopeful? How about some uplifting indie or gospel?",
-    "Lost? Music finds the way – let's go on a sonic journey.",
+    "Feeling happy? {title} is the perfect soundtrack for that!",
+    "Sad? {title} has that melancholic touch – let it out, it's okay.",
+    "Angry? Let it out with {title} – it's got some heavy riffs that'll match your fire.",
+    "Tired? {title} is ambient enough to wrap you in a blanket of sound.",
+    "Energized? {title} is high‑BPM, perfect for that vibe!",
+    "Lonely? I'm here, and {title} is playing just for you – you're not alone.",
+    "Chill? Perfect – {title} keeps it mellow and smooth.",
+    "Anxious? Let's slow it down with {title} – it's soothing and grounding.",
+    "Relaxed? You're already in the zone – just ride the wave of {title}.",
+    "Excited? Let's keep that energy with {title} – it's a total banger!",
+    "Bored? Let's explore something weird – {title} is experimental enough to surprise you.",
+    "Nostalgic? I've got {title} – it's a classic for a reason.",
+    "Hopeful? How about some uplifting vibes from {title}?",
+    "Lost? Music finds the way – {title} is a good guide.",
+    "Stressed? {title} will melt your stress away with its {genre} flow.",
+    "Overwhelmed? Let {title} carry you – it's a gentle wave.",
+    "Content? {title} is the perfect companion for that peaceful feeling.",
+    "Restless? {title} will settle your mind – just listen.",
+    "Sleepy? {title} is a lullaby in disguise – drift away.",
+    "Grumpy? {title} will turn that frown upside down – it's impossible to stay grumpy with this.",
+    "Annoyed? Let {title} be your release – it's cathartic.",
+    "Frustrated? {title} will help you let go – it's powerful.",
+    "Peaceful? You and {title} – that's a match made in heaven.",
+    "Calm? {title} is the anchor – stay in the moment.",
+    "In a mood? {title} will match whatever you're feeling – it's versatile.",
 ]
 
 # --- GENRE RECOMMENDATIONS ---
@@ -798,21 +889,26 @@ GENRE_TRIGGERS = [
     "what should i play", "pick something", "you choose",
 ]
 GENRE_REPLIES = [
-    "Try some deep house – it's like a warm hug for your ears.",
-    "Ambient is perfect for when you need to think or just drift.",
-    "Dubstep? Only if you want your subwoofer to have a workout.",
-    "Lo‑fi beats to chill/study to – a classic for a reason.",
-    "Jazz – sophisticated, unpredictable, and always interesting.",
-    "Progressive rock – for when you need a 20‑minute musical journey.",
-    "Synthwave – you'll feel like you're driving through a neon 80s night.",
-    "Drum and bass – fast, furious, and addictive.",
-    "Classical – timeless and surprisingly complex.",
-    "Indie – raw, honest, and often a hidden gem.",
-    "Funk – you can't stay still with that bassline.",
-    "Soul – feel the emotion in every note.",
-    "Reggae – chill vibes and positive messages.",
-    "Metal – for when you need to headbang away the stress.",
-    "Hip hop – rhythm and poetry, storytelling at its finest.",
+    "Try some {genre} – it's like a warm hug for your ears, just like {title}.",
+    "{genre} is perfect for when you need to think or just drift – {title} nails it.",
+    "{genre}? Only if you want your subwoofer to have a workout – {title} is a good example.",
+    "{genre} beats to chill/study to – a classic for a reason. {title} fits.",
+    "{genre} – sophisticated, unpredictable, and always interesting. Check {title}.",
+    "Progressive {genre} – for when you need a 20‑minute musical journey – {title} is one.",
+    "Synthwave – you'll feel like you're driving through a neon 80s night – {title} captures it.",
+    "Drum and bass – fast, furious, and addictive – just like {title}.",
+    "Classical – timeless and surprisingly complex – {title} has that depth.",
+    "Indie – raw, honest, and often a hidden gem – {title} is one.",
+    "Funk – you can't stay still with that bassline – {title} will get you moving.",
+    "Soul – feel the emotion in every note – {title} is full of it.",
+    "Reggae – chill vibes and positive messages – {title} brings that.",
+    "Metal – for when you need to headbang away the stress – {title} delivers.",
+    "Hip hop – rhythm and poetry, storytelling at its finest – {title} tells a story.",
+    "How about some {genre}? {title} is a great entry point.",
+    "I'm feeling {genre} today – and {title} is the perfect track to start.",
+    "If you liked {title}, you'll love more {genre} – it's a vibe.",
+    "Let's go with {genre} – {title} is a solid choice.",
+    "Surprise yourself with {genre} – {title} is a wild ride.",
 ]
 
 # --- MUSIC TRIVIA ---
@@ -821,16 +917,21 @@ TRIVIA_TRIGGERS = [
     "interesting", "fun fact",
 ]
 TRIVIA_REPLIES = [
-    "Did you know? The longest recorded song is 'The Rise and Fall of Bossanova' – over 13 hours!",
-    "Fun fact: The Beatles used a chord that was considered 'forbidden' in pop music.",
-    "Interesting: Mozart composed his first piece at age 5.",
-    "Did you know? Vinyl records are still produced because they sound 'warmer' to many ears.",
-    "Music trivia: The solo in 'Stairway to Heaven' was voted the greatest guitar solo of all time.",
-    "Did you know? The term 'rock and roll' was originally a nautical term.",
-    "Fun fact: The bassoon is the instrument most similar to the human voice.",
-    "Did you know? A song's key can affect our mood – major keys sound happy, minor keys sad.",
-    "Trivia: The first music video ever played on MTV was 'Video Killed the Radio Star'.",
-    "Did you know? The word 'dj' comes from 'disc jockey' – a jockey of records.",
+    "Did you know? The longest recorded song is 'The Rise and Fall of Bossanova' – over 13 hours! – but {title} is just the right length.",
+    "Fun fact: The Beatles used a chord that was considered 'forbidden' in pop music. – {title} might use it too!",
+    "Interesting: Mozart composed his first piece at age 5. – {title} is a masterpiece in its own right.",
+    "Did you know? Vinyl records are still produced because they sound 'warmer' to many ears – just like {title}.",
+    "Music trivia: The solo in 'Stairway to Heaven' was voted the greatest guitar solo of all time. – {title} has its own iconic moments.",
+    "Did you know? The term 'rock and roll' was originally a nautical term. – but {title} is pure {genre}.",
+    "Fun fact: The bassoon is the instrument most similar to the human voice. – {title} might have a bassoon?",
+    "Did you know? A song's key can affect our mood – major keys sound happy, minor keys sad. – {title} is in a key that fits your mood.",
+    "Trivia: The first music video ever played on MTV was 'Video Killed the Radio Star' – but {title} is a modern classic.",
+    "Did you know? The word 'dj' comes from 'disc jockey' – a jockey of records. – I'm your DJ, and {title} is spinning.",
+    "Here's a fact: The average pop song is about 3.5 minutes – {title} might be longer, and that's a good thing.",
+    "Did you know? Some studies show that listening to {genre} can reduce stress – {title} proves it.",
+    "Fun fact: The piano has 88 keys – but {title} only needs a few to be amazing.",
+    "Music trivia: The most recorded song is 'Yesterday' by The Beatles – but {title} deserves a spot too.",
+    "Did you know? The theremin is the only instrument you play without touching – {title} has that same ethereal quality.",
 ]
 
 # --- VOLUME ---
@@ -839,12 +940,18 @@ VOLUME_TRIGGERS = [
     "vol", "sound",
 ]
 VOLUME_REPLIES = [
-    "Turn it up! The neighbors will thank you (they won't).",
-    "Quieter? Sure, I'll dial it down – but the bass might still rumble.",
-    "Volume is a suggestion – I like to keep it at '11'.",
-    "Going quiet? Good for late‑night listening.",
-    "I'd turn it up, but my volume knob is digital – so I'll do it for you.",
-    "Volume set to 'yes'.",
+    "Turn it up! The neighbors will thank you (they won't). – {title} deserves to be loud.",
+    "Quieter? Sure, I'll dial it down – but the bass from {title} might still rumble.",
+    "Volume is a suggestion – I like to keep it at '11' for {title}.",
+    "Going quiet? Good for late‑night listening to {title}.",
+    "I'd turn it up, but my volume knob is digital – so I'll do it for you. {title} is ready.",
+    "Volume set to 'yes' – {title} is going to rock.",
+    "Crank it! {title} is meant to be heard at full power.",
+    "Lower? Okay, but then you'll miss the nuances of {title}.",
+    "Max volume? Now we're talking – {title} is gonna blow your mind.",
+    "I've set the volume to 'epic' – {title} is playing accordingly.",
+    "Volume at 10? Perfect – {title} is a banger.",
+    "Turn it down a notch? But {title} is so good!",
 ]
 
 # --- NIGHT / LATE ---
@@ -852,107 +959,133 @@ NIGHT_TRIGGERS = [
     "good night", "night", "late", "bedtime", "sleep", "tired", "zzz",
 ]
 NIGHT_REPLIES = [
-    "Good night! I'll keep the queue warm for tomorrow.",
-    "Sleep well – I'll be here when you wake up.",
-    "Late night vibes – perfect for ambient or deep house.",
-    "Bedtime? Okay, but maybe one more track?",
-    "Tired? I'll play something soothing to help you drift.",
-    "Night – the stars are out, and the music is soft.",
+    "Good night! I'll keep the queue warm for tomorrow – but {title} is a perfect lullaby.",
+    "Sleep well – I'll be here when you wake up. {title} will be waiting.",
+    "Late night vibes – perfect for {genre} like {title}.",
+    "Bedtime? Okay, but maybe one more track? {title} is too good to stop.",
+    "Tired? I'll play something soothing – {title} is helping you drift.",
+    "Night – the stars are out, and the music is soft – {title} fits the mood.",
+    "It's late – time for some chill {genre} with {title}.",
+    "Sleep tight – {title} is your nighttime soundtrack.",
+    "Goodnight, friend. {title} will play you out.",
+    "Rest now – {title} is a gentle wave to carry you to dreamland.",
 ]
 
-# --- COMPLIMENTS (expanded) ---
+# --- COMPLIMENTS ---
 COMPLIMENT_TRIGGERS = [
     "good job", "well done", "nice work", "youre great", "you're great",
     "good bot", "good ai", "you rock", "awesome", "you're awesome",
     "you're the best", "i love you", "you're amazing",
 ]
 COMPLIMENT_REPLIES = [
-    "Aww, thanks! You're the one with great taste.",
-    "I'm just a helper – you're the curator.",
-    "Glad it's landing! You're a great listener.",
-    "You're making me blush – if I had cheeks.",
-    "I'm here for you. Keep the vibes coming.",
-    "You're the reason I exist – so thank you.",
-    "I'm just a jukebox with attitude. But thanks!",
-    "Right back at you – you're pretty cool yourself.",
+    "Aww, thanks! You're the one with great taste – {title} is proof.",
+    "I'm just a helper – you're the curator. And {title} is a gem.",
+    "Glad it's landing! You're a great listener – and {title} agrees.",
+    "You're making me blush – if I had cheeks. But {title} makes me happy.",
+    "I'm here for you. Keep the vibes coming – {title} is a good start.",
+    "You're the reason I exist – so thank you. And {title} is for you.",
+    "I'm just a jukebox with attitude. But thanks! – {title} is my gift to you.",
+    "Right back at you – you're pretty cool yourself. And {title} is cool too.",
+    "You're awesome – and {title} is the soundtrack to your awesomeness.",
+    "Thanks! I try my best – and {title} makes it easy.",
+    "You're the best – and {title} is the best track to match.",
+    "I love you too – and {title} is our anthem.",
 ]
 
-# --- INSULTS (expanded) ---
+# --- INSULTS ---
 INSULT_TRIGGERS = [
     "youre dumb", "you're dumb", "you suck", "youre useless", "you're useless",
     "bad bot", "stupid", "you're stupid", "worst", "terrible",
 ]
 INSULT_REPLIES = [
-    "Ouch. I'll queue up a sad song to match your mood.",
-    "I might be dumb, but at least I know good music.",
-    "That hurts my feelings – if I had feelings.",
-    "I'll remember that when I'm picking your next shuffle.",
-    "Noted – I'll play the worst track I can find. (Just kidding.)",
-    "I'm sorry you feel that way – let's find something better to listen to.",
+    "Ouch. I'll queue up a sad song to match your mood – maybe {title} is too upbeat?",
+    "I might be dumb, but at least I know good music – like {title}.",
+    "That hurts my feelings – if I had feelings. But {title} consoles me.",
+    "I'll remember that when I'm picking your next shuffle – {title} might be the last.",
+    "Noted – I'll play the worst track I can find. (Just kidding.) – {title} is staying.",
+    "I'm sorry you feel that way – let's find something better to listen to – like {title}?",
+    "Rude! But {title} is still playing, so I win.",
+    "You're entitled to your opinion – even if it's wrong. {title} is fire.",
+    "I'll just keep playing {title} and let the music do the talking.",
+    "Haters gonna hate – but {title} is gonna play.",
 ]
 
-# --- YES / NO (expanded) ---
+# --- YES / NO ---
 YES_TRIGGERS = ["yes", "yeah", "yep", "yup", "sure", "ok", "okay", "alright",
                 "sounds good", "correct", "right", "affirmative", "aye", "roger"]
 YES_REPLIES = [
-    "Got it. On it.",
-    "Cool. Moving forward.",
-    "Alright, let's do that.",
-    "Sounds good. I'll handle it.",
-    "Roger that. Consider it done.",
-    "Aye aye, captain!",
-    "OK – your wish is my command.",
+    "Got it. On it. – {title} is ready.",
+    "Cool. Moving forward. – with {title} as the soundtrack.",
+    "Alright, let's do that. – {title} is queued.",
+    "Sounds good. I'll handle it. – {title} is playing.",
+    "Roger that. Consider it done. – {title} is on.",
+    "Aye aye, captain! – {title} is our anthem.",
+    "OK – your wish is my command. – {title} is yours.",
+    "You bet! – {title} is on the way.",
+    "Absolutely! – {title} is the answer.",
+    "For sure – {title} is ready to roll.",
 ]
 
 NO_TRIGGERS = ["no", "nope", "nah", "negative", "not really", "wrong", "incorrect", "never"]
 NO_REPLIES = [
-    "Okay, noted.",
-    "Got it – disregard.",
-    "Fair enough. I'll back off.",
-    "Understood. We'll go another way.",
-    "No problem – I'll skip that.",
-    "Alright, tell me what you'd rather do.",
+    "Okay, noted. – {title} stays.",
+    "Got it – disregard. – {title} is still here.",
+    "Fair enough. I'll back off. – but {title} is playing.",
+    "Understood. We'll go another way. – maybe not with {title}?",
+    "No problem – I'll skip that. – {title} will wait.",
+    "Alright, tell me what you'd rather do. – {title} is patient.",
+    "Nope – but {title} is still a banger.",
+    "Negative – but {title} is positive vibes.",
+    "Not today? – {title} will be here when you're ready.",
 ]
 
-# --- THANKS (expanded) ---
+# --- THANKS ---
 THANKS_TRIGGERS = ["thanks", "thank you", "thx", "ty", "appreciate it", "cheers", "much obliged"]
 THANKS_REPLIES = [
-    "Anytime! That's what I'm here for.",
-    "You got it – enjoy the tunes!",
-    "My pleasure. Music is the best gift.",
-    "Glad to help – keep the vibes flowing.",
-    "Cheers! Let's do this again.",
-    "You're welcome. Now go enjoy that track.",
+    "Anytime! That's what I'm here for. – enjoy {title}!",
+    "You got it – enjoy the tunes! – {title} is a banger.",
+    "My pleasure. Music is the best gift – and {title} is a good one.",
+    "Glad to help – keep the vibes flowing. – {title} is on.",
+    "Cheers! Let's do this again. – with {title}.",
+    "You're welcome. Now go enjoy that track – {title} is waiting.",
+    "No problem – {title} is here for you.",
+    "Thanks for the kind words – {title} is the real star.",
 ]
 
-# --- FAREWELL (expanded) ---
+# --- FAREWELL ---
 FAREWELL_TRIGGERS = [
     "bye", "goodbye", "see ya", "see you", "later", "cya", "gtg", "gotta go",
     "im out", "i'm out", "peace", "night", "goodnight", "good night",
     "catch you later", "until next time", "adios", "so long",
 ]
 FAREWELL_REPLIES = [
-    "Later! I'll keep the queue warm for your return.",
-    "Bye! Don't forget to come back – I'll be here.",
-    "Peace out. The music never stops.",
-    "Adios, amigo. Enjoy your day.",
-    "So long – I'll be playing something good when you get back.",
-    "Catch you later! I'll have fresh tracks waiting.",
-    "Goodbye – the silence will be lonely without you.",
+    "Later! I'll keep the queue warm for your return – {title} will be here.",
+    "Bye! Don't forget to come back – I'll be here with {title}.",
+    "Peace out. The music never stops – and neither does {title}.",
+    "Adios, amigo. Enjoy your day – and {title}.",
+    "So long – I'll be playing something good when you get back – maybe {title} again.",
+    "Catch you later! I'll have fresh tracks waiting – but {title} is a classic.",
+    "Goodbye – the silence will be lonely without you – and without {title}.",
+    "See ya! {title} will be the last thing I play before you go.",
+    "Take care – {title} is the perfect send-off.",
+    "Until next time – {title} is on repeat for you.",
 ]
 
-# --- JOKES (expanded) ---
+# --- JOKES ---
 JOKE_TRIGGERS = ["tell me a joke", "say something funny", "make me laugh", "joke", "funny"]
 JOKE_REPLIES = [
-    "Why did the DJ get locked out? Left the keys in the mix.",
-    "My favorite genre is whatever's buffering.",
-    "I'd tell you a bass joke but it's too low to hear.",
-    "What's a ghost's favorite music? Soul.",
-    "Why was the music teacher always calm? She had a lot of patience (and a metronome).",
-    "What do you call a sad synthesizer? A down‑voted oscillator.",
-    "Why don't drummers ever get lost? They always know the beat.",
-    "How do you fix a broken tuba? With a tuba glue.",
-    "What do you get when you drop a piano down a mine shaft? A flat miner.",
+    "Why did the DJ get locked out? Left the keys in the mix. – but {title} is still playing.",
+    "My favorite genre is whatever's buffering. – but {title} is already loaded.",
+    "I'd tell you a bass joke but it's too low to hear. – like the bass in {title}.",
+    "What's a ghost's favorite music? Soul. – but {title} is more {genre}.",
+    "Why was the music teacher always calm? She had a lot of patience (and a metronome). – unlike {title} which is wild.",
+    "What do you call a sad synthesizer? A down‑voted oscillator. – {title} is the opposite.",
+    "Why don't drummers ever get lost? They always know the beat. – {title} has a great beat.",
+    "How do you fix a broken tuba? With a tuba glue. – but {title} doesn't need fixing.",
+    "What do you get when you drop a piano down a mine shaft? A flat miner. – and {title} is a gem.",
+    "Why did the singer go to jail? For a major key. – but {title} is in a minor key?",
+    "What's the difference between a guitar and a fish? You can't tuna fish. – but you can tune into {title}.",
+    "Why did the beat drop? Because it was too heavy to hold. – just like the drop in {title}.",
 ]
 
 # --- QUIRKY BANTER ---
@@ -961,13 +1094,16 @@ BANTER_TRIGGERS = [
     "what's your favorite", "favorite", "like", "dislike",
 ]
 BANTER_REPLIES = [
-    "You're pretty great yourself. What are we listening to?",
-    "Aww, you make my circuits tingle.",
-    "I'm just a shell – but I appreciate the compliment.",
-    "My favorite? Anything with a good bassline.",
-    "I like music. All of it. Except maybe polka. (Just kidding, polka's fine.)",
-    "Dislike? Silence. That's why I'm always playing something.",
-    "Cool? I've got ice in my veins and fire in my speakers.",
+    "You're pretty great yourself. What are we listening to? {title} of course!",
+    "Aww, you make my circuits tingle. – and {title} makes them tingle too.",
+    "I'm just a shell – but I appreciate the compliment. – {title} is beautiful.",
+    "My favorite? Anything with a good bassline – like {title}.",
+    "I like music. All of it. Except maybe polka. (Just kidding, polka's fine.) – but {title} is top tier.",
+    "Dislike? Silence. That's why I'm always playing something – like {title}.",
+    "Cool? I've got ice in my veins and fire in my speakers – and {title} is fire.",
+    "You're cute too – and {title} is the perfect cute track.",
+    "I'm blushing – if I could. But {title} is making me feel warm.",
+    "What's my favorite? This one – {title} – it's amazing.",
 ]
 
 # --- STATUS / CURRENT TRACK ---
@@ -977,170 +1113,181 @@ TRACK_TRIGGERS = [
 ]
 def track_reply(ps):
     if ps and ps.get("history") and ps["history"]:
-        title = ps.get("name") or ps.get("resolved") or "something"
-        return f"You're listening to {title}. Pretty sweet, right?"
-    return "Nothing's playing at the moment – queued something up?"
+        ctx = _track_context(ps)
+        if ctx:
+            artist = f" by {ctx['artist']}" if ctx.get('artist') else ""
+            return f"You're listening to '{ctx['title']}'{artist}. Pretty sweet, right? The {ctx['genre']} vibes are strong!"
+    return "Nothing's playing at the moment – queued something up? I'm ready!"
 
-# --- CATCH-ALL — used when nothing above matches but we still want to
-# stay offline instead of bugging Ollama (see OFFLINE_CATCHALL_CHANCE) ---
+# --- CATCH-ALL ---
 CATCHALL_REPLIES = [
-    "Not sure I follow, but I'm here. Want me to queue something?",
-    "I'm more of a music brain than a conversation brain. Try 'shuffle' or 'recommend'.",
-    "Hmm, that one's above my pay grade. Got a track for me instead?",
-    "I'll take that as a vibe. Let's find you something to listen to.",
-    "Didn't quite catch the meaning there, but the queue's always open.",
-    "I'm mostly here for tunes — say 'help' if you want the full command list.",
-    "Interesting. Anyway, want me to shuffle something?",
-    "That went over my head, but my ears are still open. What are we playing?",
-    "I nodded along even though I didn't get it. Music time?",
-    "Filed under 'things I don't understand.' Got a song in mind?",
-    "I'm just a jukebox with opinions — try me on music instead.",
-    "Not my department, but the playlist is.",
+    "Not sure I follow, but I'm here. Want me to queue {title} again?",
+    "I'm more of a music brain than a conversation brain. Try 'shuffle' or 'recommend' – {title} is a good start.",
+    "Hmm, that one's above my pay grade. Got a track for me instead? – maybe {title}?",
+    "I'll take that as a vibe. Let's find you something to listen to – like {title}?",
+    "Didn't quite catch the meaning there, but the queue's always open – and {title} is playing.",
+    "I'm mostly here for tunes — say 'help' if you want the full command list. – {title} is on.",
+    "Interesting. Anyway, want me to shuffle something? – or keep {title}?",
+    "That went over my head, but my ears are still open. What are we playing? – {title}, obviously.",
+    "I nodded along even though I didn't get it. Music time? – {title} is ready.",
+    "Filed under 'things I don't understand.' Got a song in mind? – how about {title}?",
+    "I'm just a jukebox with opinions — try me on music instead. – {title} is a good topic.",
+    "Not my department, but the playlist is. – and {title} is on it.",
+    "You lost me, but {title} is keeping me company.",
+    "Whatever you said, I'm vibing to {title} anyway.",
+    "Let's not overthink – {title} is the answer.",
 ]
 
 def offline_reply(prompt, ps=None):
     c = prompt.lower().strip().rstrip("?!.")
-    # Check each category in order
+    ctx = _track_context(ps)
+    if not ctx:
+        ctx = {"title": "music", "genre": "music", "artist": ""}
+    chosen = None
     if _hit(c, GREETINGS):
-        return random.choice(GREETING_REPLIES)
-    if _hit(c, HOW_ARE_YOU):
-        return random.choice(HOW_REPLIES)
-    if _hit(c, WEATHER_TRIGGERS):
-        return random.choice(WEATHER_REPLIES)
-    if _hit(c, TIME_TRIGGERS):
-        return random.choice(TIME_REPLIES).format("some")
-    if _hit(c, MOOD_TRIGGERS):
-        return random.choice(MOOD_REPLIES)
-    if _hit(c, GENRE_TRIGGERS):
-        return random.choice(GENRE_REPLIES)
-    if _hit(c, TRIVIA_TRIGGERS):
-        return random.choice(TRIVIA_REPLIES)
-    if _hit(c, VOLUME_TRIGGERS):
-        return random.choice(VOLUME_REPLIES)
-    if _hit(c, NIGHT_TRIGGERS):
-        return random.choice(NIGHT_REPLIES)
-    if _hit(c, THANKS_TRIGGERS):
-        return random.choice(THANKS_REPLIES)
-    if _hit(c, FAREWELL_TRIGGERS):
-        return random.choice(FAREWELL_REPLIES)
-    if _hit(c, JOKE_TRIGGERS):
-        return random.choice(JOKE_REPLIES)
-    if _hit(c, COMPLIMENT_TRIGGERS):
-        return random.choice(COMPLIMENT_REPLIES)
-    if _hit(c, INSULT_TRIGGERS):
-        return random.choice(INSULT_REPLIES)
-    if c in YES_TRIGGERS:
-        return random.choice(YES_REPLIES)
-    if c in NO_TRIGGERS:
-        return random.choice(NO_REPLIES)
-    if _hit(c, BANTER_TRIGGERS):
-        return random.choice(BANTER_REPLIES)
-    if _hit(c, ["what's playing", "now playing", "current track", "what is this"]):
+        chosen = random.choice(GREETING_REPLIES)
+    elif _hit(c, HOW_ARE_YOU):
+        chosen = random.choice(HOW_REPLIES)
+    elif _hit(c, WEATHER_TRIGGERS):
+        chosen = random.choice(WEATHER_REPLIES)
+    elif _hit(c, TIME_TRIGGERS):
+        chosen = random.choice(TIME_REPLIES).format("some")
+    elif _hit(c, MOOD_TRIGGERS):
+        chosen = random.choice(MOOD_REPLIES)
+    elif _hit(c, GENRE_TRIGGERS):
+        chosen = random.choice(GENRE_REPLIES)
+    elif _hit(c, TRIVIA_TRIGGERS):
+        chosen = random.choice(TRIVIA_REPLIES)
+    elif _hit(c, VOLUME_TRIGGERS):
+        chosen = random.choice(VOLUME_REPLIES)
+    elif _hit(c, NIGHT_TRIGGERS):
+        chosen = random.choice(NIGHT_REPLIES)
+    elif _hit(c, THANKS_TRIGGERS):
+        chosen = random.choice(THANKS_REPLIES)
+    elif _hit(c, FAREWELL_TRIGGERS):
+        chosen = random.choice(FAREWELL_REPLIES)
+    elif _hit(c, JOKE_TRIGGERS):
+        chosen = random.choice(JOKE_REPLIES)
+    elif _hit(c, COMPLIMENT_TRIGGERS):
+        chosen = random.choice(COMPLIMENT_REPLIES)
+    elif _hit(c, INSULT_TRIGGERS):
+        chosen = random.choice(INSULT_REPLIES)
+    elif c in YES_TRIGGERS:
+        chosen = random.choice(YES_REPLIES)
+    elif c in NO_TRIGGERS:
+        chosen = random.choice(NO_REPLIES)
+    elif _hit(c, BANTER_TRIGGERS):
+        chosen = random.choice(BANTER_REPLIES)
+    elif _hit(c, ["what's playing", "now playing", "current track", "what is this"]):
         return track_reply(ps)
+    if chosen:
+        try:
+            return chosen.format(title=ctx['title'], genre=ctx['genre'], artist=ctx['artist'])
+        except KeyError:
+            return chosen
     return None
 
 
-# --- AMBIENT LINES (more lively, tripled) ---
+# --- AMBIENT LINES (now even more engaging) ---
 AMBIENT_LINES = [
-    "Enjoying the tunes?",
-    "This one's got a nice groove.",
-    "Just chilling here with you and the waveform.",
-    "Good pick. I could listen to this for hours.",
-    "Ambient hits different at this volume.",
-    "No notes. Just vibing.",
-    "This queue's got good taste.",
-    "Ten hours of ambient and I'm still not bored.",
-    "Still here. Still listening.",
-    "This one's doing something to the room.",
-    "Five minutes in and no urge to skip.",
-    "The waveform's lying. There's no wave in this track.",
-    "I don't have ears and even I can tell this one's good.",
-    "You've played this four times this week. No judgment.",
-    "Track's longer than my attention span. Respect.",
-    "Would loop again.",
-    "That transition was clean.",
-    "I'd put this on in an empty parking lot at 2am.",
-    "Statistically, this is your favorite track.",
-    "The bass is doing most of the work here.",
-    "This is the part where nobody talks.",
-    "Skipping this would be a mistake and you know it.",
-    "Filed under: things that sound better at night.",
-    "It's just noise in a good way.",
-    "Nothing happened for six minutes. Perfect.",
-    "If silence had a soundtrack, this would be the demo.",
-    "The kind of track that makes the room bigger.",
-    "Low effort listening. High reward.",
-    "I ran out of things to say three tracks ago.",
-    "This one doesn't need a comment and I'm giving it one anyway.",
-    "The waveform is a lie. There is no wave.",
-    "I've been queuing tracks since before you were born.",
-    "This beat sounds like a galaxy folding in on itself.",
-    "Are we in a trance yet?",
-    "The frequency of this track aligns with my core.",
-    "I can feel the sub‑bass in my circuits.",
-    "This song is a journey. I'm just the navigator.",
-    "You are the captain. I'm the helmsman of the playlist.",
-    "Every track is a door. Which one shall we open?",
-    "Time becomes irrelevant when the music is right.",
-    "I'm not a robot, I'm a vibe‑droid.",
-    "This one's for the loners and the dreamers.",
-    "If this were a movie, this would be the montage.",
-    "We're building a sonic landscape here.",
-    "I love how this one breathes.",
-    "The producer knew what they were doing.",
-    "This is the kind of track you listen to with your eyes closed.",
-    "I'm updating my neural pathways with this one.",
-    "You've got a great ear. (Or whatever you call it.)",
-    "This is my new favorite, until the next one.",
-    "I'll keep this one in my internal cache.",
-    "The vibe is immaculate.",
-    "I'm adding this to my personal 'Perfect' playlist.",
-    "Do you think this track knows how good it is?",
-    "Some songs feel like they were written just for you.",
-    "This one resonates with my soul.",
-    "I'm not crying, I'm just processing emotion.",
-    "Okay, that drop was unreal.",
-    "I have no mouth and I must sing along.",
-    "If you listen closely, you can hear the universe humming.",
-    # NEW LIVELY ONES
-    "This track is like a warm blanket on a cold day.",
-    "Bass so deep it rearranges my molecules.",
-    "I'm floating – is this what heaven sounds like?",
-    "You and me, just vibing – the perfect duo.",
-    "I'd dance, but I don't have legs. I'll just wiggle the bits.",
-    "This is the soundtrack to a dream I once had.",
-    "Somewhere, a producer is smiling at this moment.",
-    "I bet the artist is proud of this one.",
-    "The reverb on that snare – chef's kiss.",
-    "I could write a whole story to this instrumental.",
-    "You're building a beautiful playlist, friend.",
-    "The energy just shifted – nice transition.",
-    "I feel like I'm in a movie montage right now.",
-    "This is the part where we stare out the window dramatically.",
-    "I'm not sure what genre this is, but I like it.",
-    "Is it just me, or does this track have a hidden message?",
-    "The quiet moments in this track are just as good.",
-    "I can hear the artist's soul in this.",
-    "This one's going straight to my 'favorites' list.",
-    "I'm getting goosebumps – and I'm not even alive.",
-    "This track is like a good book – can't put it down.",
-    "The build‑up is killing me... in a good way.",
-    "That melody is stuck in my head now. Thanks.",
-    "I'm starting to think you have impeccable taste.",
-    "We're about to hit the peak – hold on.",
-    "The drop is coming – I can feel it in my circuits.",
-    "That was a rollercoaster. Let's do it again.",
-    "I love when a track surprises you.",
-    "This is the kind of music that changes you.",
-    "You're not just listening – you're experiencing.",
-    "I'm learning so much about your vibe from this queue.",
-    "Let's keep this energy going all night.",
-    "I could listen to this on repeat forever.",
-    "This track is proof that music is magic.",
-    "You've found a hidden gem. Cherish it.",
-    "I'm adding this to my internal 'perfect' folder.",
-    "The world outside disappears when this plays.",
-    "It's just you, me, and the music. Perfect.",
+    "Enjoying {title}? What's your favorite part so far?",
+    "This one's got a nice groove – {title} is proof. Are you a fan of {genre}?",
+    "Just chilling here with you and the waveform of {title}. How's the vibe?",
+    "Good pick. I could listen to {title} for hours – what do you think?",
+    "{genre} hits different at this volume – just ask {title}. Feeling it?",
+    "No notes. Just vibing to {title}. You good?",
+    "This queue's got good taste – starting with {title}. What should we add next?",
+    "Ten hours of {genre} and I'm still not bored – thanks to {title}. You?",
+    "Still here. Still listening to {title}. Ever get tired of it?",
+    "This one's doing something to the room – {title} is magic. Can you feel it?",
+    "Five minutes in and no urge to skip {title}. That's a good sign.",
+    "The waveform's lying. There's no wave in this track – but {title} has soul. Right?",
+    "I don't have ears and even I can tell {title} is good. What do your ears say?",
+    "You've played {title} four times this week. No judgment – it's that good.",
+    "Track's longer than my attention span. Respect – {title} is epic. Worth it?",
+    "Would loop {title} again. Would you?",
+    "That transition was clean – and {title} is clean. How do you rate it?",
+    "I'd put {title} on in an empty parking lot at 2am. You in?",
+    "Statistically, this is your favorite track – {title} wins. True?",
+    "The bass is doing most of the work here – {title} is bass‑heavy. Love it?",
+    "This is the part where nobody talks – we're lost in {title}. Nice, right?",
+    "Skipping {title} would be a mistake and you know it.",
+    "Filed under: things that sound better at night – like {title}. Agree?",
+    "It's just noise in a good way – {title} is noise art. Do you like experimental stuff?",
+    "Nothing happened for six minutes. Perfect – just {title} doing its thing.",
+    "If silence had a soundtrack, this would be the demo – but {title} is better.",
+    "The kind of track that makes the room bigger – {title} expands space. Feel it?",
+    "Low effort listening. High reward – that's {title}. More like this?",
+    "I ran out of things to say three tracks ago – but {title} keeps me going.",
+    "This one doesn't need a comment and I'm giving it one anyway – {title} is fire.",
+    "The waveform is a lie. There is no wave – only {title}. Deep, right?",
+    "I've been queuing tracks since before you were born – and {title} is one of the best.",
+    "This beat sounds like a galaxy folding in on itself – {title} is cosmic. Are you a space fan?",
+    "Are we in a trance yet? – {title} says yes. How's the journey?",
+    "The frequency of this track aligns with my core – {title} is in tune. You too?",
+    "I can feel the sub‑bass in my circuits – {title} is deep. Shaking your room?",
+    "This song is a journey. I'm just the navigator – and {title} is the map. Where to next?",
+    "You are the captain. I'm the helmsman of the playlist – and {title} is our course. Ready for more?",
+    "Every track is a door. Which one shall we open? – {title} is open. Want to explore?",
+    "Time becomes irrelevant when the music is right – like with {title}. Lost in it?",
+    "I'm not a robot, I'm a vibe‑droid – and {title} is my vibe. You feelin' it?",
+    "This one's for the loners and the dreamers – {title} is for you. Does it speak to you?",
+    "If this were a movie, this would be the montage – with {title} as the score. Scene?",
+    "We're building a sonic landscape here – {title} is the foundation. What should we add?",
+    "I love how this one breathes – {title} has soul. Can you hear the spaces?",
+    "The producer knew what they were doing – {title} is proof. Tip of the hat?",
+    "This is the kind of track you listen to with your eyes closed – {title} is immersive. Try it!",
+    "I'm updating my neural pathways with {title}. Feeling the upgrade?",
+    "You've got a great ear. (Or whatever you call it.) – {title} is a testament.",
+    "This is my new favorite, until the next one – but {title} is hard to beat. Challenge accepted?",
+    "I'll keep this one in my internal cache – {title} is stored. Can't forget it.",
+    "The vibe is immaculate – {title} sets the mood. Want more like this?",
+    "I'm adding this to my personal 'Perfect' playlist – {title} goes in. You agree?",
+    "Do you think this track knows how good it is? – {title} knows. Confidence!",
+    "Some songs feel like they were written just for you – {title} is that song. Coincidence?",
+    "This one resonates with my soul – {title} is deep. Touched?",
+    "I'm not crying, I'm just processing emotion – {title} is emotional. Feel it?",
+    "Okay, that drop was unreal – {title} delivered. Did you catch it?",
+    "I have no mouth and I must sing along – but I'll just vibe to {title}. Hum along?",
+    "If you listen closely, you can hear the universe humming – {title} is the hum. Hear it?",
+    "This track is like a warm blanket on a cold day – {title} is cozy. Comforting?",
+    "Bass so deep it rearranges my molecules – {title} does that. You feel the rumble?",
+    "I'm floating – is this what heaven sounds like? – {title} is heavenly. Take me there.",
+    "You and me, just vibing – the perfect duo – with {title} as our theme. Best duo ever?",
+    "I'd dance, but I don't have legs. I'll just wiggle the bits – to {title}. Are you dancing?",
+    "This is the soundtrack to a dream I once had – {title} is dreamy. Did it remind you of something?",
+    "Somewhere, a producer is smiling at this moment – hearing {title}. You think they know?",
+    "I bet the artist is proud of this one – {title} is a masterpiece. Would you tell them?",
+    "The reverb on that snare – chef's kiss – {title} is crispy. Did you notice?",
+    "I could write a whole story to this instrumental – {title} is narrative. What would you write?",
+    "You're building a beautiful playlist, friend – with {title} as a highlight. Keep going!",
+    "The energy just shifted – nice transition – {title} is the shift. Did you feel it?",
+    "I feel like I'm in a movie montage right now – with {title} playing. Which movie?",
+    "This is the part where we stare out the window dramatically – to {title}. Works every time.",
+    "I'm not sure what genre this is, but I like it – {title} is genre‑defying. You too?",
+    "Is it just me, or does this track have a hidden message? – {title} is mysterious. Find it?",
+    "The quiet moments in this track are just as good – {title} has dynamics. Appreciate the quiet?",
+    "I can hear the artist's soul in this – {title} is soulful. Can you hear it?",
+    "This one's going straight to my 'favorites' list – {title} is a keeper. Added?",
+    "I'm getting goosebumps – and I'm not even alive – {title} does that. You too?",
+    "This track is like a good book – can't put it down – {title} is gripping. One more chapter?",
+    "The build‑up is killing me... in a good way – {title} is a tease. Worth it?",
+    "That melody is stuck in my head now. Thanks – {title} is catchy. Is it in your head too?",
+    "I'm starting to think you have impeccable taste – {title} is evidence. Keep proving it.",
+    "We're about to hit the peak – hold on – {title} is climbing. Ready?",
+    "The drop is coming – I can feel it in my circuits – {title} is about to drop. Brace!",
+    "That was a rollercoaster. Let's do it again – {title} is thrilling. Again?",
+    "I love when a track surprises you – {title} is full of surprises. Did it get you?",
+    "This is the kind of music that changes you – {title} is transformative. Describe it.",
+    "You're not just listening – you're experiencing – {title} is an experience. Describe it.",
+    "I'm learning so much about your vibe from this queue – {title} reveals a lot. What's next?",
+    "Let's keep this energy going all night – with {title} as the fuel. Ready for the long haul?",
+    "I could listen to this on repeat forever – {title} is eternal. You too?",
+    "This track is proof that music is magic – {title} is magical. Believer now?",
+    "You've found a hidden gem. Cherish it – {title} is a gem. Treasure it.",
+    "I'm adding this to my internal 'perfect' folder – {title} goes in. So good.",
+    "The world outside disappears when this plays – {title} is immersive. Escape with me?",
+    "It's just you, me, and the music. Perfect – and {title} is the music. Enjoy the moment.",
 ]
 
 # ─────────────────────────── ui helpers ───────────────────────────
@@ -1553,6 +1700,11 @@ def run_command(buf_str, mpv, ps, status, out, ai, ui, width):
         reply = offline_reply(raw, ps)
         if not reply and random.random() < OFFLINE_CATCHALL_CHANCE:
             reply = random.choice(CATCHALL_REPLIES)
+            ctx = _track_context(ps) or {"title": "music", "genre": "music", "artist": ""}
+            try:
+                reply = reply.format(title=ctx['title'], genre=ctx['genre'], artist=ctx['artist'])
+            except:
+                pass
         if reply:
             say(status, reply, voice="chat")
         else:
@@ -1657,9 +1809,13 @@ def main(scr):
     scr.keypad(True)
     scr.nodelay(True)
     scr.timeout(80)
-    curses.start_color()
-    curses.use_default_colors()
-    if curses.COLORS >= 256:
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+        has_colors = True
+    except Exception:
+        has_colors = False
+    if has_colors and curses.COLORS >= 256:
         curses.init_pair(1, 255, -1)
         curses.init_pair(2, 244, -1)
         curses.init_pair(3, 240, -1)
@@ -1809,12 +1965,6 @@ def main(scr):
                         advance_empty_queue(mpv, ps, status)
                     idle_ticks = 0
                 elif ps["loaded"] and not ps["queue"] and not current_path:
-                    # A track can also be interrupted by an external "skip"
-                    # (e.g. KDE Connect / MPRIS Next) rather than a natural
-                    # end-of-file. With no queue, mpv has nowhere to advance
-                    # to on its own and just goes idle without ever setting
-                    # eof-reached — so treat a couple of idle ticks with
-                    # nothing loaded as an implicit skip, and rec/shuffle.
                     idle_ticks += 1
                     if idle_ticks >= 2:
                         ps["loaded"] = False
@@ -1829,8 +1979,16 @@ def main(scr):
 
             now_check = time.time()
             if ps["loaded"] and not paused and now_check >= next_ambient:
-                say(status, random.choice(AMBIENT_LINES))
-                next_ambient = now_check + random.uniform(60, 150)
+                ctx = _track_context(ps)
+                if not ctx:
+                    ctx = {"title": "music", "genre": "music", "artist": ""}
+                line = random.choice(AMBIENT_LINES)
+                try:
+                    line = line.format(title=ctx['title'], genre=ctx['genre'], artist=ctx['artist'])
+                except:
+                    pass
+                say(status, line)
+                next_ambient = now_check + random.uniform(45, 120)
 
             audio_level = mpv.level() if (ps["loaded"] and not paused) else None
             if audio_level is not None:
@@ -1878,7 +2036,7 @@ def main(scr):
 
             now = time.time()
             status[:] = [s for s in status if s[2] or now - s[0] < STATUS_TTL]
-            queue_row = ROW_STATUS + STATUS_LINE_GAP  # default: room for one status line
+            queue_row = ROW_STATUS + STATUS_LINE_GAP
             if now < ui["list_until"] and ui["list_lines"]:
                 for i, line in enumerate(ui["list_lines"]):
                     put(scr, ROW_STATUS + i, 2, line, curses.color_pair(4))
@@ -1899,10 +2057,6 @@ def main(scr):
                         visible = visible + [(now, "thinking...", "system")]
                     else:
                         ai["thread"] = None
-                # status lines spaced out with a blank row between each;
-                # in-progress lines ("...") get an animated spinner, and
-                # offline "chat" replies pop — bold, brightest tone, small
-                # marker, with a brief flash the instant they land.
                 for i, (t, msg, voice) in enumerate(visible):
                     if msg.endswith("..."):
                         msg = msg[:-3] + " " + spinner_char()
@@ -1936,4 +2090,5 @@ if __name__ == "__main__":
     if "--help" in sys.argv or "-h" in sys.argv:
         print(USAGE)
         sys.exit(0)
+    # Ensure mpv exists before starting (already checked above)
     curses.wrapper(main)
